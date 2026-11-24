@@ -11,6 +11,11 @@ venv/
 workspace/
 credentials/
 logs/
+# Local face profiles (faces/<name>/profile.json + crops + vectors)
+# and voice identities — personal biometric data, NEVER committed.
+faces/
+identities/
+alerts/
 
 # macOS
 .DS_Store

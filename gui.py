@@ -39,6 +39,7 @@ LLM_PROVIDER=ollama). The GUI is the face; agent.py is the brain.
 
 import math
 import os
+import queue
 import random
 import sys
 import threading
@@ -170,9 +171,24 @@ class OracleGUI:
         self.mode = "idle"  # idle, thinking, speaking
         self.phase = 0.0
         self.history = []
-        self.always_listen = False
+        # Always listening is the designed default (v1.0.8, parity with
+        # Windows): mic open, no wake word, started at launch.
+        self.always_listen = True
         self.speak_replies = True
         self.busy = False
+        self._ask_started = None  # datetime the current _ask thread started
+        # Main-thread UI queue (v1.0.8, ported from Windows):
+        # tkinter is NOT thread-safe. Worker threads must NEVER call
+        # root.after() / widget methods directly — a cross-thread
+        # root.after() can silently fail, which once left _ask's reply
+        # undelivered and busy=True forever ("thinking forever",
+        # 2026-11-24). Workers put callables here via _post_ui();
+        # the main thread drains them on its own clock tick
+        # (_drain_ui_queue, every 50 ms). _ask's reply delivery uses
+        # this queue; older root.after(0, ...) call sites elsewhere
+        # in this file are unchanged for now (see NEXT_BUILD_FEATURES
+        # item 4 — migrating them is follow-up, not a release gate).
+        self._ui_queue = queue.Queue()
         # --- Fluid lip-sync state (v1.0.6, ported from Windows) ---
         self.lip_level = 0.0
         self._lip_target_level = 0.0
@@ -187,11 +203,13 @@ class OracleGUI:
         self.listen_thread = None
         self.watcher = None
         self.camera_controller = None
+        # Auto-track defaults ON when the camera is on (v1.0.8-mac, item 7).
+        self.auto_track_enabled = True
         self.stars = [(random.random(), random.random(), random.choice([1, 1, 2]))
                       for _ in range(90)]
         self.avatar_photo = None      # normal avatar PhotoImage
         self.avatar_blink_photo = None  # squashed (blink) version
-        self.avatar_size = 260
+        self.avatar_size = 420  # hi-res render (was 260)
         self._load_avatar()
 
         self._build_top()
@@ -203,10 +221,20 @@ class OracleGUI:
             pass
         self.animate()
         self._tick_clock()
+        self._drain_ui_queue()
 
         # Muse memory (v1.0.7): pick up any export files dropped in
         # memory_import/ and say, in one line, what Oracle remembers.
         self._memory_startup()
+        # Always listening starts automatically at launch (v1.0.8,
+        # parity with Windows). toggle_listen() flips the flag, so
+        # start it by calling the toggle once from the default ON
+        # state — wrapped so a missing mic never blocks startup.
+        try:
+            self.always_listen = False
+            self.toggle_listen()
+        except Exception:
+            self.always_listen = False
         self.append("system", f"{AGENT_NAME} online. Ask me anything — watch the core light up when I answer.")
         if PROVIDER == "openai" and not os.environ.get("OPENAI_API_KEY"):
             self.append("system", "Note: OPENAI_API_KEY is not set yet, so replies will fail until you set it on your Mac (see README.md / ORACLE_SETUP_MAC.md) — do not paste the key here.")
@@ -235,6 +263,12 @@ class OracleGUI:
                     continue
                 img = Image.open(cand).convert("RGBA")
                 img.thumbnail((self.avatar_size, self.avatar_size), Image.LANCZOS)
+                try:
+                    from PIL import ImageEnhance as _IE
+                    img = _IE.Sharpness(img).enhance(1.25)
+                    img = _IE.Contrast(img).enhance(1.05)
+                except Exception:
+                    pass
                 self.avatar_photo = ImageTk.PhotoImage(img)
                 # Blink frame: same image squashed vertically, centred
                 # on the same spot in animate() — reads as a blink.
@@ -392,6 +426,12 @@ class OracleGUI:
         priv = self._btn(cam_card, "Privacy mode", self.camera_privacy)
         priv.pack(fill="x", pady=2)
         self._btn(cam_card, "Test camera (grab a frame)", self.test_camera_gui).pack(fill="x", pady=2)
+        # Auto-track toggle (v1.0.8-mac, item 7) — default ON.
+        self.track_btn = self._btn(cam_card, "Auto-Track: ON", self.toggle_autotrack)
+        self.track_btn.pack(fill="x", pady=2)
+        self.track_label = tk.Label(cam_card, text="Tracking: —", font=("Helvetica Neue", 9, "bold"),
+                                    fg=t["muted"], bg=t["panel"])
+        self.track_label.pack(anchor="w", pady=(4, 0))
         self.cam_label = tk.Label(cam_card, text="Camera: OFF", font=("Helvetica Neue", 9, "bold"),
                                   fg=t["muted"], bg=t["panel"])
         self.cam_label.pack(anchor="w", pady=(4, 0))
@@ -405,6 +445,7 @@ class OracleGUI:
 
         people_card = self._card(deck, "◐  PEOPLE  •  HOME MODE")
         self._btn(people_card, "Enroll voice", self.enroll_voice_gui).pack(fill="x", pady=2)
+        self._btn(people_card, "Enroll face (camera)", self.enroll_face_gui).pack(fill="x", pady=2)
         self._btn(people_card, "List enrolled",
                   lambda: self.append("system", f"Enrolled (local only): {identity_mod.list_identities() if identity_mod else 'identity module missing'}")).pack(fill="x", pady=2)
         self._btn(people_card, "Delete identity", self.delete_identity_gui).pack(fill="x", pady=2)
@@ -424,7 +465,7 @@ class OracleGUI:
         # Glowing core canvas, in a neon-bordered frame
         core_frame = tk.Frame(right, bg=t["accent"], padx=1, pady=1)
         core_frame.pack(fill="x")
-        self.canvas = tk.Canvas(core_frame, height=300, bg=t["bg"], highlightthickness=0)
+        self.canvas = tk.Canvas(core_frame, height=480, bg=t["bg"], highlightthickness=0)
         self.canvas.pack(fill="x")
         self.mode_label = tk.Label(right, text="—  IDLE  —", font=("Helvetica Neue", 10, "bold"),
                                    fg=t["accent"], bg=t["bg"])
@@ -464,9 +505,72 @@ class OracleGUI:
         self.t = THEMES[name]
         self.root.configure(bg=self.t["bg"])
 
+    def _log_gui(self, line):
+        """Append one timestamped line to oracle-gui.log in APP_DIR
+        (next to Oracle.app when frozen), so watchdog resets and
+        failed replies can be verified from outside the GUI.
+        Never raises. The log holds no API key or credential."""
+        try:
+            log_path = APP_DIR / "oracle-gui.log"
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {line}\n")
+        except Exception:
+            pass
+
+    def _post_ui(self, fn):
+        """Queue a callable to run on the main (tkinter) thread.
+
+        The ONLY way worker threads should touch the UI. Never call
+        root.after() or widget methods from a worker thread."""
+        try:
+            self._ui_queue.put(fn)
+        except Exception:
+            pass
+
+    def _drain_ui_queue(self):
+        """Main-thread drain of the UI queue, every 50 ms."""
+        try:
+            while True:
+                fn = self._ui_queue.get_nowait()
+                try:
+                    fn()
+                except Exception as e:
+                    self._log_gui(f"UI QUEUE ERROR: {e}")
+        except queue.Empty:
+            pass
+        except Exception:
+            pass
+        try:
+            self.root.after(50, self._drain_ui_queue)
+        except Exception:
+            pass
+
     def _tick_clock(self):
         try:
             self.clock_label.config(text=datetime.now().strftime("%H:%M  •  %a %d %b"))
+        except Exception:
+            pass
+        # Watchdog (v1.0.8, ported from Windows): if a reply thread
+        # started >120 s ago and busy is still True, the THINKING
+        # state is stuck — reset it visibly instead of ignoring
+        # every later speak/type forever.
+        try:
+            if self.busy and self._ask_started is not None:
+                elapsed = (datetime.now() - self._ask_started).total_seconds()
+                if elapsed > 120:
+                    self.busy = False
+                    self._ask_started = None
+                    self.mode = "idle"
+                    self._typing_done = True
+                    self._speech_done = True
+                    self._lip_target_level = 0.0
+                    self._lip_shape = "closed"
+                    try:
+                        self.status.config(text="● ONLINE", fg=self.t["good"])
+                    except Exception:
+                        pass
+                    self.append("system", "Timed out — I got stuck thinking, please try again.")
+                    self._log_gui("WATCHDOG: stuck THINKING reset after 120s")
         except Exception:
             pass
         self.root.after(1000, self._tick_clock)
@@ -491,10 +595,10 @@ class OracleGUI:
         c = self.canvas
         try:
             w = c.winfo_width() or 800
-            h = 300
+            h = 480
         except Exception:
             w, h = 800, 300
-        cx, cy = w // 2, 138
+        cx, cy = w // 2, 210
         c.delete("all")
 
         # Starfield
@@ -522,7 +626,7 @@ class OracleGUI:
 
         if self.avatar_photo is not None:
             # Soft aura behind the avatar (glow, not a ring)
-            for r, col in [(110, _darken(t["accent"], 0.18)), (88, _darken(t["accent"], 0.28))]:
+            for r, col in [(178, _darken(t["accent"], 0.18)), (142, _darken(t["accent"], 0.28))]:
                 c.create_oval(hx - r, hy - r * 0.9, hx + r, hy + r * 0.9, fill=col, outline="")
             ax, ay = hx + look_x, hy + look_y
             photo = self.avatar_blink_photo if (blinking and self.avatar_blink_photo is not None) else self.avatar_photo
@@ -531,12 +635,19 @@ class OracleGUI:
             # driven by the real speech level + phoneme shape.
             # Idle: no overlay, the avatar's own mouth shows.
             if self.mode == "speaking":
-                mouth_cy = ay + 38
+                mouth_cy = ay + 61
                 mw, mh = self._mouth_dims()
+                mw, mh = int(mw * 1.615), int(mh * 1.615)  # avatar is 1.615x larger now
+                # A mouth is wider than it is tall — clamp the height so
+                # the overlay reads as an open mouth, not a round hole.
+                if self._lip_shape in ("wide", "open"):
+                    mh = min(mh, int(mw * 0.7))
+                elif self._lip_shape == "slight":
+                    mh = min(mh, int(mw * 0.5))
                 c.create_oval(ax - mw, mouth_cy - mh, ax + mw, mouth_cy + mh,
                               fill="#08101f", outline=t["accent2"], width=1)
             elif self.mode == "thinking":
-                c.create_line(ax - 14, ay + 38, ax + 14, ay + 38, fill=t["accent"], width=2)
+                c.create_line(ax - 23, ay + 61, ax + 23, ay + 61, fill=t["accent"], width=3)
         else:
             # Fallback: original vector head drawn in code (no show assets).
             # Neck and shoulders
@@ -598,7 +709,7 @@ class OracleGUI:
             else:
                 bh = 8 + abs(math.sin(self.phase * 0.5 + i * 0.3)) * 12 * falloff
             col = t["accent"] if i % 2 == 0 else t["accent2"]
-            c.create_line(x, cy + 132, x, cy + 132 - bh, fill=col, width=4)
+            c.create_line(x, cy + 210, x, cy + 210 - bh, fill=col, width=4)
 
         # Mode text on canvas
         label = {"idle": "IDLE  •  AWAITING INPUT", "thinking": "THINKING  •  PROCESSING",
@@ -638,6 +749,7 @@ class OracleGUI:
         if self._typing_done and self._speech_done and self.busy:
             self.mode = "idle"
             self.busy = False
+            self._ask_started = None
             try:
                 self.status.config(text="● ONLINE", fg=self.t["good"])
             except Exception:
@@ -854,16 +966,16 @@ class OracleGUI:
         win = tk.Toplevel(self.root)
         win.overrideredirect(True)
         win.attributes("-topmost", True)
-        win.geometry("280x300+200+200")
+        win.geometry("440x430+200+200")
         self.avatar_win = win
-        canvas = tk.Canvas(win, width=280, height=260, bg=self.t["bg"],
+        canvas = tk.Canvas(win, width=440, height=400, bg=self.t["bg"],
                            highlightthickness=0)
         canvas.pack(fill="both", expand=True)
         self._avatar_canvas = canvas
         if self.avatar_photo is not None:
-            canvas.create_image(140, 130, image=self.avatar_photo, tags="avatar")
+            canvas.create_image(220, 200, image=self.avatar_photo, tags="avatar")
         else:
-            canvas.create_oval(60, 30, 220, 230, fill=self.t["panel2"],
+            canvas.create_oval(90, 48, 350, 370, fill=self.t["panel2"],
                                outline=self.t["accent"], width=2)
         restore = tk.Button(win, text="⤢  Restore full window",
                             font=("Helvetica Neue", 9, "bold"),
@@ -897,7 +1009,8 @@ class OracleGUI:
             c.delete("mouth")
             if self.mode == "speaking":
                 mw, mh = self._mouth_dims()
-                c.create_oval(140 - mw, 168 - mh, 140 + mw, 168 + mh,
+                mw, mh = int(mw * 1.615), int(mh * 1.615)
+                c.create_oval(220 - mw, 261 - mh, 220 + mw, 261 + mh,
                               fill="#40160f", outline="", tags="mouth")
             self.avatar_win.after(33, self._avatar_only_animate)
         except Exception:
@@ -973,7 +1086,7 @@ class OracleGUI:
                 import time as _time
                 _time.sleep(0.5)
                 continue
-            heard = voice_mod.listen_once(timeout=3)
+            heard = voice_mod.listen_once(timeout=10, phrase_time_limit=30)
             if heard and self.always_listen:
                 self.root.after(0, lambda h=heard: self.handle_user_text(h, spoken=True))
 
@@ -1000,8 +1113,13 @@ class OracleGUI:
                 self.watcher = camera_mod.Watcher(
                     controller=self.camera_controller,
                     on_alert=lambda txt: self.root.after(0, lambda: self.append("system", txt)),
+                    on_track=lambda info: self.root.after(0, lambda: self._on_track_update(info)),
                 )
                 msg = self.watcher.start()
+                # Auto-track defaults ON when the camera is on (item 7).
+                self.watcher.set_auto_track(self.auto_track_enabled)
+                self._refresh_track_button()
+                self._on_track_update({})
                 self.watch_btn.config(text="Stop camera watch", bg=self.t["danger"])
                 self.cam_label.config(text="Camera: WATCHING", fg=self.t["danger"])
                 self.cam_pill.config(text="CAM: ON", fg=self.t["danger"])
@@ -1012,6 +1130,7 @@ class OracleGUI:
         else:
             msg = self.watcher.stop()
             self.watcher = None
+            self.track_label.config(text="Tracking: —", fg=self.t["muted"])
             self.watch_btn.config(text="Start camera watch", bg=self.t["panel2"])
             self.cam_label.config(text="Camera: OFF", fg=self.t["muted"])
             self.cam_pill.config(text="CAM: OFF", fg=self.t["muted"])
@@ -1033,6 +1152,45 @@ class OracleGUI:
             self.append("system", "Privacy mode: camera watch is off. Tilt the PIXY down manually, or unplug it, for guaranteed privacy.")
         self.cam_label.config(text="Camera: PRIVACY", fg=self.t["good"])
         self.cam_pill.config(text="CAM: PRIVACY", fg=self.t["good"])
+
+    # ------------------------------------------------ auto-track (v1.0.8-mac, item 7)
+    def _refresh_track_button(self):
+        try:
+            self.track_btn.config(
+                text=f"Auto-Track: {'ON' if self.auto_track_enabled else 'OFF'}")
+        except Exception:
+            pass
+
+    def toggle_autotrack(self):
+        self.auto_track_enabled = not self.auto_track_enabled
+        if self.watcher is not None:
+            self.append("system", self.watcher.set_auto_track(self.auto_track_enabled))
+        else:
+            self.append("system", f"Auto-Track will be {'ON' if self.auto_track_enabled else 'OFF'} when you start camera watch.")
+        self._refresh_track_button()
+        self._on_track_update({})
+
+    def _on_track_update(self, _info):
+        """Watcher thread -> main thread: show who is tracked/identified."""
+        try:
+            if self.watcher is not None:
+                text = self.watcher.track_status_text()
+            else:
+                text = "Tracking: —"
+            self.track_label.config(text=text)
+        except Exception:
+            pass
+
+    def enroll_face_gui(self):
+        """Enrol the face currently on camera (local only, item 9)."""
+        if self.watcher is None:
+            self.append("system", "Start camera watch first, then enrol the face in view.")
+            return
+        import tkinter.simpledialog as sd
+        name = sd.askstring("Enroll face", "Whose face is on camera? Enter their name:")
+        if not name:
+            return
+        self.append("system", self.watcher.enrol_current(name))
 
     def enroll_voice_gui(self):
         if identity_mod is None:
@@ -1075,6 +1233,69 @@ class OracleGUI:
                 self.root.after(0, lambda: self.append("system", f"Board look failed: {e}"))
         threading.Thread(target=_run, daemon=True).start()
 
+    def _handle_camera_command(self, user_text, spoken=False):
+        """Local camera commands: 'track me', 'stop tracking', 'who is
+        that', 'enrol this person as <name>'. Returns True if handled
+        (no LLM call), False to fall through to the normal reply path.
+        Matching is case-insensitive; names keep the user's casing."""
+        low = user_text.strip().lower()
+        if not low:
+            return False
+        watcher = self.watcher
+
+        def _need_watcher():
+            if watcher is None:
+                self.append("user", user_text + ("  [spoken]" if spoken else ""))
+                self.append("system", "Start camera watch first, then I can do that.")
+                return False
+            return True
+
+        if low in ("track me", "track this person", "start tracking", "follow me"):
+            self.append("user", user_text + ("  [spoken]" if spoken else ""))
+            if not _need_watcher():
+                return True
+            self.auto_track_enabled = True
+            self._refresh_track_button()
+            self.append("system", watcher.track_me())
+            return True
+        if low.startswith("track ") and len(low) > 6:
+            # Ambiguous without a running camera ("track my package"):
+            # only treat it as a camera command when the watcher is on.
+            if watcher is None:
+                return False
+            self.append("user", user_text + ("  [spoken]" if spoken else ""))
+            name = user_text.strip()[6:].strip()
+            self.auto_track_enabled = True
+            self._refresh_track_button()
+            self.append("system", watcher.track_me(name))
+            return True
+        if low in ("stop tracking", "stop following", "stop following me"):
+            self.append("user", user_text + ("  [spoken]" if spoken else ""))
+            if not _need_watcher():
+                return True
+            self.auto_track_enabled = False
+            self._refresh_track_button()
+            self.append("system", watcher.stop_tracking())
+            self._on_track_update({})
+            return True
+        if low in ("who is this", "who is that", "who is that person",
+                   "who do you see", "who is on camera"):
+            self.append("user", user_text + ("  [spoken]" if spoken else ""))
+            if watcher is None:
+                self.append("system", "The camera isn't on — start camera watch and I'll tell you who I see.")
+            else:
+                self.append("system", watcher.track_status_text())
+            return True
+        for prefix in ("enrol this person as ", "enroll this person as "):
+            if low.startswith(prefix):
+                self.append("user", user_text + ("  [spoken]" if spoken else ""))
+                if not _need_watcher():
+                    return True
+                name = user_text.strip()[len(prefix):].strip()
+                self.append("system", watcher.enrol_current(name))
+                return True
+        return False
+
     def on_send(self):
         user_text = self.entry.get().strip()
         if not user_text:
@@ -1083,11 +1304,16 @@ class OracleGUI:
         self.handle_user_text(user_text)
 
     def handle_user_text(self, user_text, spoken=False):
+        # Camera tracking / face commands are handled locally, without
+        # calling the LLM (v1.0.8-mac, items 7 + 9).
+        if self._handle_camera_command(user_text, spoken=spoken):
+            return
         if self.busy:
             return
         self.busy = True
         self._typing_done = False
         self._speech_done = False
+        self._ask_started = datetime.now()
         self.append("user", user_text + ("  [spoken]" if spoken else ""))
         self.history.append({"role": "user", "content": user_text})
         self.mode = "thinking"
@@ -1100,61 +1326,98 @@ class OracleGUI:
         # every reply thread died with TypeError before answering.
         # user_text itself is unused here; the turn is already in
         # self.history. It is kept only so the call matches.
-        if call_llm is None:
-            reply = "I could not load my brain (agent.py). Make sure agent.py is in the same folder as gui.py."
-        else:
-            # Memory (v1.0.7): what Oracle knows about Lorenza, from
-            # Muse conversations and its own memory.json. Read fresh
-            # on the worker thread each time so a just-imported file
-            # is used in the very next reply.
-            memory_text = ""
-            if memory_import is not None:
+        # Runs on a worker thread: never touch tkinter directly.
+        # Replies are delivered via _post_ui (the main-thread UI
+        # queue). try/except guarantees a failed _ask still posts a
+        # visible reply — or clears busy as a last resort — instead
+        # of leaving the GUI stuck on THINKING. busy is cleared by
+        # _typewriter when the reply finishes typing; the 120s
+        # watchdog in _tick_clock clears it if the reply never
+        # reaches the screen.
+        try:
+            if call_llm is None:
+                reply = "I could not load my brain (agent.py). Make sure agent.py is in the same folder as gui.py."
+            else:
+                # Memory (v1.0.7): what Oracle knows about Lorenza, from
+                # Muse conversations and its own memory.json. Read fresh
+                # on the worker thread each time so a just-imported file
+                # is used in the very next reply.
+                memory_text = ""
+                if memory_import is not None:
+                    try:
+                        memory_text = memory_import.load_memory_text(APP_DIR)
+                    except Exception:
+                        memory_text = ""
+                system = PERSONALITY
+                if memory_text:
+                    system += ("\n\nWHAT YOU KNOW ABOUT LORENZA (from Muse conversations "
+                               "and your own memory — use it, refer to it naturally, "
+                               "and continue these open threads):\n" + memory_text)
+                messages = [{"role": "system", "content": system}] + self.history
                 try:
-                    memory_text = memory_import.load_memory_text(APP_DIR)
-                except Exception:
-                    memory_text = ""
-            system = PERSONALITY
-            if memory_text:
-                system += ("\n\nWHAT YOU KNOW ABOUT LORENZA (from Muse conversations "
-                           "and your own memory — use it, refer to it naturally, "
-                           "and continue these open threads):\n" + memory_text)
-            messages = [{"role": "system", "content": system}] + self.history
+                    reply = call_llm(messages)
+                except Exception as e:
+                    reply = (f"I hit a problem reaching OpenAI: {e}. "
+                             "Check that OPENAI_API_KEY is set on this PC and that you have internet, then try again.")
+            self.history.append({"role": "assistant", "content": reply})
+            self._log_gui(f"ASK OK: {(user_text or '')[:80]!r} -> reply {len(reply)} chars")
+            self._post_ui(lambda r=reply: self._typewriter(r))
+        except Exception as e:
+            self._log_gui(f"ASK FAILED: {e}")
             try:
-                reply = call_llm(messages)
-            except Exception as e:
-                reply = (f"I hit a problem reaching OpenAI: {e}. "
-                         "Check that OPENAI_API_KEY is set on this PC and that you have internet, then try again.")
-        self.history.append({"role": "assistant", "content": reply})
-        self.root.after(0, lambda: self._typewriter(reply))
+                self._post_ui(lambda err=e: self._typewriter(
+                    f"I hit a problem answering that: {err}. Please try again."))
+            except Exception:
+                # Last resort: the UI queue itself is broken. busy,
+                # _ask_started and mode are plain attributes, safe to
+                # reset here; the watchdog fixes the status pill on
+                # its next tick.
+                self.busy = False
+                self._ask_started = None
+                self.mode = "idle"
 
     def _typewriter(self, full_text, idx=0):
-        if idx == 0:
-            self.mode = "speaking"
-            self.status.config(text="● SPEAKING", fg=self.t["accent"])
-            if self.speak_replies and voice_mod is not None:
-                voice_mod.speak_async(
-                    full_text,
-                    on_level=self._on_speech_level,
-                    on_done=lambda: self.root.after(0, self._on_speech_done),
-                )
+        # Runs on the main thread only (via _post_ui). Any exception
+        # here must still clear busy, or the GUI sticks on THINKING.
+        try:
+            if idx == 0:
+                self.mode = "speaking"
+                self.status.config(text="● SPEAKING", fg=self.t["accent"])
+                if self.speak_replies and voice_mod is not None:
+                    voice_mod.speak_async(
+                        full_text,
+                        on_level=self._on_speech_level,
+                        on_done=lambda: self.root.after(0, self._on_speech_done),
+                    )
+                else:
+                    self._speech_done = True
+                self.text.configure(state="normal")
+                self.text.insert("end", f"{AGENT_NAME}: ", "oracle")
+                self.text.configure(state="disabled")
+            if idx < len(full_text):
+                chunk = full_text[idx:idx + 3]
+                self.text.configure(state="normal")
+                self.text.insert("end", chunk, "oracle")
+                self.text.configure(state="disabled")
+                self.text.see("end")
+                self.root.after(18, lambda: self._typewriter(full_text, idx + 3))
             else:
-                self._speech_done = True
-            self.text.configure(state="normal")
-            self.text.insert("end", f"{AGENT_NAME}: ", "oracle")
-            self.text.configure(state="disabled")
-        if idx < len(full_text):
-            chunk = full_text[idx:idx + 3]
-            self.text.configure(state="normal")
-            self.text.insert("end", chunk, "oracle")
-            self.text.configure(state="disabled")
-            self.text.see("end")
-            self.root.after(18, lambda: self._typewriter(full_text, idx + 3))
-        else:
-            self.text.configure(state="normal")
-            self.text.insert("end", "\n\n")
-            self.text.configure(state="disabled")
+                self.text.configure(state="normal")
+                self.text.insert("end", "\n\n")
+                self.text.configure(state="disabled")
+                self._typing_done = True
+                self._maybe_finish_speaking()
+        except Exception as e:
+            self._log_gui(f"TYPEWRITER FAILED: {e}")
+            self.mode = "idle"
+            self.busy = False
             self._typing_done = True
-            self._maybe_finish_speaking()
+            self._speech_done = True
+            self._ask_started = None
+            try:
+                self.status.config(text="● ONLINE", fg=self.t["good"])
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
