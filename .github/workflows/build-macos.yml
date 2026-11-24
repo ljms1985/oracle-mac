@@ -1,48 +1,74 @@
-# Oracle for macOS — GitHub Actions build
+# Oracle for macOS — GitHub Actions build (INTEL / x86_64)
 #
-# Builds a standalone, double-clickable Oracle.app on a real Mac in the
-# cloud (GitHub-hosted macOS runner). No Mac owned by Lorenza is needed
-# to produce the .app.
+# Builds a standalone, double-clickable Oracle.app for INTEL Macs on a
+# real Intel Mac in the cloud (GitHub-hosted macos-15-intel runner).
+# This is the build for Candice's quad-core Intel Core i5 Mac, which
+# reported "isn't supported on this Mac" for the arm64 build.
+#
+# WHY NOT macos-13, AND WHY NOT CROSS-BUILD FROM arm64:
+#   - macos-13 (the last free Intel runner) was retired Dec 4, 2025
+#     (GitHub blog, "macOS 13 runner image is closing down").
+#   - macos-15-intel is the replacement: standard GitHub-hosted runner,
+#     x86_64, 4 vCPU / 14 GB, free for public repos, active until
+#     ~Aug 2027 (GitHub will end Intel support entirely after that).
+#   - PyInstaller does NOT cross-compile: an x86_64 binary needs an
+#     x86_64 Python interpreter. Setting target_arch='x86_64' on an
+#     arm64 (macos-15) runner does not produce a working Intel binary.
+#     This workflow therefore runs natively on macos-15-intel.
+#   - Rosetta 2 translates x86_64 -> arm64, never the reverse, so an
+#     arm64-only .app can never run on an Intel Mac.
+#
+# MACOSX_DEPLOYMENT_TARGET=10.13 is set so the binary aims at the
+# oldest macOS Python 3.12 supports, maximising the chance it runs on
+# Candice's Mac even if she is not on macOS 15. Her exact macOS
+# version is unknown — if she is on macOS 10.12 or older this will
+# still fail, and that would need the source-run fallback (see
+# INTEL_BUILD_NOTES.md).
 #
 # UNSIGNED BUILD — no signing secrets, no Apple ID, no notarization.
-# The .app is ad-hoc signed only (codesign --sign -), which proves the
-# bundle is intact but is NOT Apple Developer ID signing. On first
-# launch on a real Mac, Gatekeeper will refuse a plain double-click:
-# the user must right-click Oracle.app and choose Open, then confirm.
-# For a signed/notarized release (no warning on first launch), an
-# Apple Developer Program membership ($99/year) and signing secrets
-# would be needed later — that is a separate step, not this workflow.
+# The .app is ad-hoc signed only (codesign --sign -). On first launch
+# on a real Mac, Gatekeeper will refuse a plain double-click: the user
+# must right-click Oracle.app and choose Open, then confirm.
 #
 # Triggers:
-#   - Manually: Actions tab -> "Build Oracle for macOS" -> Run workflow
-#   - Automatically: pushing a tag like v1.0.0 (git tag v1.0.0 && git push --tags)
+#   - Manually: Actions tab -> "Build Oracle for macOS (Intel)" -> Run workflow
+#   - Automatically: pushing a tag like v1.0.0-intel (git tag v1.0.0-intel && git push --tags)
 #
 # Outputs (download from the finished run, under "Artifacts"):
-#   - Oracle-macos-arm64-unsigned.zip  — the .app, zipped (Apple Silicon)
-#   - Oracle-macos-arm64.dmg          — disk image with Oracle.app + Applications link
+#   - Oracle-macos-x86_64-unsigned.zip  — the .app, zipped (Intel)
+#   - Oracle-macos-x86_64.dmg          — disk image with Oracle.app + Applications link
 #
 # What the workflow does NOT do: it does not publish a release, does not
 # upload anything to the App Store, and does not test the GUI by clicking
-# it — it builds the app and verifies the bundle is present, arm64, and
-# ad-hoc signed. A human still needs to open the .app on a real Mac and
-# check the avatar, voice, and camera work there.
+# it — it builds the app and verifies the bundle is present, x86_64, and
+# ad-hoc signed, including a sweep of every Mach-O file in the bundle
+# (one arm64-only .so would launch and then die when that library loads).
+# A human still needs to open the .app on a real Intel Mac and check the
+# avatar, voice, and camera work there.
 
-name: Build Oracle for macOS
+name: Build Oracle for macOS (Intel)
 
 on:
   workflow_dispatch:
   push:
     tags:
-      - 'v*'
+      - 'v*-intel'
 
 jobs:
-  build-macos:
-    name: Build Oracle.app (Apple Silicon, unsigned)
-    runs-on: macos-15
+  build-macos-intel:
+    name: Build Oracle.app (Intel x86_64, unsigned)
+    runs-on: macos-15-intel
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '10.13'
 
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+
+      - name: Confirm Intel runner
+        run: |
+          uname -m
+          test "$(uname -m)" = "x86_64" || (echo "ERROR: not an Intel runner" && exit 1)
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
@@ -66,14 +92,26 @@ jobs:
       - name: Build Oracle.app with PyInstaller
         run: pyinstaller oracle-mac.spec
 
-      - name: Verify the .app exists and is arm64
+      - name: Verify the .app exists and is x86_64
         run: |
           test -d dist/Oracle.app || (echo "ERROR: dist/Oracle.app was not built" && exit 1)
           file dist/Oracle.app/Contents/MacOS/Oracle
           lipo -info dist/Oracle.app/Contents/MacOS/Oracle
-          lipo -info dist/Oracle.app/Contents/MacOS/Oracle | grep -q arm64 || (echo "ERROR: binary is not arm64" && exit 1)
+          lipo -info dist/Oracle.app/Contents/MacOS/Oracle | grep -q x86_64 || (echo "ERROR: binary is not x86_64" && exit 1)
+          lipo -info dist/Oracle.app/Contents/MacOS/Oracle | grep -q arm64 && (echo "ERROR: binary unexpectedly contains arm64" && exit 1) || true
           test -f dist/Oracle.app/Contents/Resources/assets/avatar.png || (echo "ERROR: avatar.png was not bundled" && exit 1)
           ls -lh dist/Oracle.app
+          echo "--- Mach-O sweep: every binary in the bundle must contain x86_64 ---"
+          fail=0
+          while IFS= read -r f; do
+            if ! lipo -info "$f" 2>/dev/null | grep -q x86_64; then
+              echo "ERROR: no x86_64 slice in $f"
+              lipo -info "$f" || true
+              fail=1
+            fi
+          done < <(find dist/Oracle.app -type f -exec sh -c 'file "$1" | grep -q "Mach-O"' _ {} \; -print)
+          test "$fail" = "0" || (echo "ERROR: Mach-O sweep failed" && exit 1)
+          echo "Mach-O sweep passed: every Mach-O file contains x86_64"
 
       - name: Ad-hoc codesign the .app
         run: |
@@ -85,26 +123,26 @@ jobs:
           mkdir -p dmg-staging
           cp -R dist/Oracle.app dmg-staging/
           ln -s /Applications dmg-staging/Applications
-          hdiutil create -volname Oracle -srcfolder dmg-staging -ov -format UDZO Oracle-macos-arm64.dmg
-          hdiutil verify Oracle-macos-arm64.dmg
+          hdiutil create -volname Oracle -srcfolder dmg-staging -ov -format UDZO Oracle-macos-x86_64.dmg
+          hdiutil verify Oracle-macos-x86_64.dmg
 
       - name: Zip the .app
         run: |
           cd dist
-          ditto -c -k --sequesterRsrc --keepParent Oracle.app ../Oracle-macos-arm64-unsigned.zip
+          ditto -c -k --sequesterRsrc --keepParent Oracle.app ../Oracle-macos-x86_64-unsigned.zip
           cd ..
-          ls -lh Oracle-macos-arm64-unsigned.zip Oracle-macos-arm64.dmg
+          ls -lh Oracle-macos-x86_64-unsigned.zip Oracle-macos-x86_64.dmg
 
       - name: Upload .app zip artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Oracle-macos-arm64-unsigned
-          path: Oracle-macos-arm64-unsigned.zip
+          name: Oracle-macos-x86_64-unsigned
+          path: Oracle-macos-x86_64-unsigned.zip
           if-no-files-found: error
 
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Oracle-macos-arm64-dmg
-          path: Oracle-macos-arm64.dmg
+          name: Oracle-macos-x86_64-dmg
+          path: Oracle-macos-x86_64.dmg
           if-no-files-found: error

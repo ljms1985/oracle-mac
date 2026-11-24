@@ -1,9 +1,14 @@
-# PyInstaller spec for Oracle for macOS — builds a standalone Oracle.app.
+# PyInstaller spec for Oracle for macOS — INTEL (x86_64) build.
 #
-# Build ON A MAC ONLY (a .app cannot be built on Windows or Linux):
-#   pip3 install pyinstaller
-#   pyinstaller oracle-mac.spec
-# Output: dist/Oracle.app  (run it by double-clicking, or from Terminal)
+# INTEL ONLY — target_arch='x86_64'. Built on a GitHub-hosted
+# macos-15-intel runner (native Intel Mac in the cloud). Do NOT build
+# this spec on an Apple Silicon runner: PyInstaller cannot cross-build
+# an x86_64 binary from an arm64 Python interpreter. The arm64 build
+# lives in ~/workspace/oracle-mac/ (oracle-mac.spec, target_arch='arm64').
+# See INTEL_BUILD_NOTES.md for the full investigation.
+# Output: dist/Oracle.app  (Intel only — will not run on Apple Silicon
+# via Rosetta in reverse; an arm64 Mac runs it via Rosetta 2, an Intel
+# Mac runs it natively.)
 #
 # This spec was NOT built in this package — no .app was produced here
 # (see BUILD_NOTES_MAC.md). The source-tree install in
@@ -64,7 +69,7 @@ exe = EXE(
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
-    target_arch='arm64',
+    target_arch='x86_64',
     codesign_identity=None,
     entitlements_file=None,
 )
@@ -84,6 +89,7 @@ app = BUNDLE(
     icon=None,
     bundle_identifier='com.lorenza.oracle',
     info_plist={
+        'LSMinimumSystemVersion': '10.13',
         'NSMicrophoneUsageDescription': 'Oracle listens for your voice when always-listening is turned on in the GUI.',
         'NSCameraUsageDescription': 'Oracle watches through your camera only when camera watch is started in the GUI.',
     },
