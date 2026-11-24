@@ -1,0 +1,16 @@
+# Python / PyInstaller / runtime — never commit these
+__pycache__/
+*.pyc
+*.pyo
+dist/
+build/
+.venv/
+venv/
+
+# Oracle runtime data, created on first run on a Mac (or by the agent)
+workspace/
+credentials/
+logs/
+
+# macOS
+.DS_Store

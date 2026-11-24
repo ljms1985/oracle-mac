@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Oracle for macOS — daily self-improvement check (launchd).
+       Runs `python3 monitor.py` once a day at 08:00.
+       Proposals still go to proposals/ and by email, and nothing
+       applies without a clear YES. Install / remove as in
+       com.oracle.agent.plist. Replace /Users/lorenza with your own
+       macOS username. -->
+  <key>Label</key>
+  <string>com.oracle.monitor</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/python3</string>
+    <string>/Users/lorenza/Oracle/monitor.py</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/lorenza/Oracle</string>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>8</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/Users/lorenza/Oracle/logs/launchd-monitor.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/lorenza/Oracle/logs/launchd-monitor.log</string>
+</dict>
+</plist>

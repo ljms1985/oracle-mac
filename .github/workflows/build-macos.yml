@@ -1,0 +1,110 @@
+# Oracle for macOS — GitHub Actions build
+#
+# Builds a standalone, double-clickable Oracle.app on a real Mac in the
+# cloud (GitHub-hosted macOS runner). No Mac owned by Lorenza is needed
+# to produce the .app.
+#
+# UNSIGNED BUILD — no signing secrets, no Apple ID, no notarization.
+# The .app is ad-hoc signed only (codesign --sign -), which proves the
+# bundle is intact but is NOT Apple Developer ID signing. On first
+# launch on a real Mac, Gatekeeper will refuse a plain double-click:
+# the user must right-click Oracle.app and choose Open, then confirm.
+# For a signed/notarized release (no warning on first launch), an
+# Apple Developer Program membership ($99/year) and signing secrets
+# would be needed later — that is a separate step, not this workflow.
+#
+# Triggers:
+#   - Manually: Actions tab -> "Build Oracle for macOS" -> Run workflow
+#   - Automatically: pushing a tag like v1.0.0 (git tag v1.0.0 && git push --tags)
+#
+# Outputs (download from the finished run, under "Artifacts"):
+#   - Oracle-macos-arm64-unsigned.zip  — the .app, zipped (Apple Silicon)
+#   - Oracle-macos-arm64.dmg          — disk image with Oracle.app + Applications link
+#
+# What the workflow does NOT do: it does not publish a release, does not
+# upload anything to the App Store, and does not test the GUI by clicking
+# it — it builds the app and verifies the bundle is present, arm64, and
+# ad-hoc signed. A human still needs to open the .app on a real Mac and
+# check the avatar, voice, and camera work there.
+
+name: Build Oracle for macOS
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-macos:
+    name: Build Oracle.app (Apple Silicon, unsigned)
+    runs-on: macos-15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install portaudio (PyAudio needs it)
+        run: brew install portaudio
+
+      - name: Install dependencies + PyInstaller
+        run: |
+          python3 -m pip install --upgrade pip
+          pip3 install -r requirements.txt
+          pip3 install "pyinstaller>=6.0"
+          # Playwright browser (computer.py uses it for job applications)
+          python3 -m playwright install chromium --with-deps || python3 -m playwright install chromium
+
+      - name: Compile-check all Python files
+        run: python3 -m py_compile *.py
+
+      - name: Build Oracle.app with PyInstaller
+        run: pyinstaller oracle-mac.spec
+
+      - name: Verify the .app exists and is arm64
+        run: |
+          test -d dist/Oracle.app || (echo "ERROR: dist/Oracle.app was not built" && exit 1)
+          file dist/Oracle.app/Contents/MacOS/Oracle
+          lipo -info dist/Oracle.app/Contents/MacOS/Oracle
+          lipo -info dist/Oracle.app/Contents/MacOS/Oracle | grep -q arm64 || (echo "ERROR: binary is not arm64" && exit 1)
+          test -f dist/Oracle.app/Contents/Resources/assets/avatar.png || (echo "ERROR: avatar.png was not bundled" && exit 1)
+          ls -lh dist/Oracle.app
+
+      - name: Ad-hoc codesign the .app
+        run: |
+          codesign --sign - --force --deep dist/Oracle.app
+          codesign --verify --verbose dist/Oracle.app
+
+      - name: Create DMG (Oracle.app + Applications link)
+        run: |
+          mkdir -p dmg-staging
+          cp -R dist/Oracle.app dmg-staging/
+          ln -s /Applications dmg-staging/Applications
+          hdiutil create -volname Oracle -srcfolder dmg-staging -ov -format UDZO Oracle-macos-arm64.dmg
+          hdiutil verify Oracle-macos-arm64.dmg
+
+      - name: Zip the .app
+        run: |
+          cd dist
+          ditto -c -k --sequesterRsrc --keepParent Oracle.app ../Oracle-macos-arm64-unsigned.zip
+          cd ..
+          ls -lh Oracle-macos-arm64-unsigned.zip Oracle-macos-arm64.dmg
+
+      - name: Upload .app zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Oracle-macos-arm64-unsigned
+          path: Oracle-macos-arm64-unsigned.zip
+          if-no-files-found: error
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Oracle-macos-arm64-dmg
+          path: Oracle-macos-arm64.dmg
+          if-no-files-found: error

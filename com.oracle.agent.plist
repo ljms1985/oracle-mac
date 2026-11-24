@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Oracle for macOS — start the GUI at login (launchd).
+       Install: cp com.oracle.agent.plist ~/Library/LaunchAgents/
+                launchctl load ~/Library/LaunchAgents/com.oracle.agent.plist
+       Remove:  launchctl unload ~/Library/LaunchAgents/com.oracle.agent.plist
+       NOTE: replace /Users/lorenza with your own macOS username, and
+       put your real OPENAI_API_KEY in the EnvironmentVariables below
+       (or remove that key and launch Oracle from Terminal instead,
+       where ~/.zshrc already sets it). -->
+  <key>Label</key>
+  <string>com.oracle.agent</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/python3</string>
+    <string>/Users/lorenza/Oracle/gui.py</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/lorenza/Oracle</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <false/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>OPENAI_API_KEY</key>
+    <string>YOUR-KEY-HERE</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/Users/lorenza/Oracle/logs/launchd-agent.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/lorenza/Oracle/logs/launchd-agent.log</string>
+</dict>
+</plist>

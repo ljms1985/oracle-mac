@@ -1,0 +1,16 @@
+# Oracle for macOS — Python requirements
+# Install with:  pip3 install -r requirements.txt
+# (Run `brew install portaudio` first — PyAudio needs it on macOS.)
+openai
+pyttsx3
+SpeechRecognition
+pyaudio
+opencv-python
+Pillow  # required for the avatar image in gui.py (assets/avatar.png)
+numpy
+trimesh
+playwright
+# Optional, for full face matching (slow build; needs `brew install cmake dlib` first):
+# face_recognition
+# Optional, for a standalone .app build on a Mac:
+# pyinstaller
