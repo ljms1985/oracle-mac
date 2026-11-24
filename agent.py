@@ -43,7 +43,18 @@ from datetime import datetime
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
-MEMORY_FILE = BASE_DIR / "memory.json"
+# Memory lives next to Oracle.app when frozen (same folder the GUI
+# uses — see gui.py _app_dir()), NOT inside the bundle, so the GUI
+# and the CLI agent share one memory.json and it survives reinstalls.
+def _memory_dir():
+    if getattr(sys, "frozen", False):
+        exe = Path(sys.executable).resolve()
+        for parent in exe.parents:
+            if parent.suffix == ".app":
+                return parent.parent
+        return exe.parent
+    return BASE_DIR
+MEMORY_FILE = _memory_dir() / "memory.json"
 TOOLS_DIR = BASE_DIR / "tools_generated"
 BACKUP_DIR = BASE_DIR / "backups"
 
