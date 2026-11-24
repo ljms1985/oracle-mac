@@ -5,7 +5,11 @@ openai
 pyttsx3
 SpeechRecognition
 pyaudio
-opencv-python
+opencv-python==4.11.0.86
+# Pinned to 4.11: opencv-python 5.x removed CascadeClassifier and
+# HOGDescriptor, which camera auto-tracking (tracking.py) and local
+# face detection (face_profiles.py, identity.py) rely on. Do not
+# upgrade to 5.x until those modules are rewritten for it.
 Pillow  # required for the avatar image in gui.py (assets/avatar.png)
 numpy
 trimesh

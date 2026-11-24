@@ -69,6 +69,18 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+# Auto-tracking + local face recognition (v1.0.8-mac, items 7/9).
+# Both are OpenCV-only by default and degrade gracefully if OpenCV
+# 5.x is installed (no Haar/HOG there) or face_recognition is absent.
+try:
+    from tracking import AutoTracker
+except Exception:
+    AutoTracker = None
+try:
+    import face_profiles as face_profiles
+except Exception:
+    face_profiles = None
+
 BASE_DIR = Path(__file__).resolve().parent
 ALERTS_DIR = BASE_DIR / "alerts"
 
@@ -264,13 +276,38 @@ def describe_snapshot(image_path):
 
 
 class Watcher:
-    def __init__(self, controller=None, on_alert=None):
+    def __init__(self, controller=None, on_alert=None, on_track=None):
         self.controller = controller or CameraController()
         self.on_alert = on_alert  # function(text) - GUI log, etc.
+        self.on_track = on_track  # function(status dict) - GUI track label
         self.running = False
         self.armed = ARMED
         self.thread = None
         self.last_alert = 0
+        # --- Auto-track + face recognition (v1.0.8-mac) ---
+        # Auto-track defaults ON when the camera is on (NEXT_BUILD
+        # item 7). The GUI toggle flips self.auto_track via
+        # set_auto_track(); the tracker itself is created here so
+        # tracking works even without the GUI.
+        self.tracker = AutoTracker(self.controller) if AutoTracker else None
+        self.auto_track = True
+        self.last_tracked_box = None    # (x, y, w, h) or None
+        self.last_identified_name = None  # str, or None = unknown / no face
+        self.last_confidence = 0.0
+        self.last_track_status = "idle"  # tracking|holding|returning|...
+        self.unknown_seen_count = 0     # repeats of the current unknown face
+        self.frame_callback = None      # optional fn(frame, track_status)
+        self._unknown_tracker = None
+        if face_profiles is not None:
+            try:
+                self._unknown_tracker = face_profiles.UnknownTracker()
+            except Exception:
+                self._unknown_tracker = None
+        self._last_frame = None
+        self._frame_count = 0
+        self._last_track_report = None
+        self._last_track_report_at = 0.0
+        self._camera_lost_reported = False
 
     def start(self):
         if self.running:
@@ -286,18 +323,184 @@ class Watcher:
         self.controller.close()
         return "Watcher stopped."
 
+    # -- Auto-track / face recognition (v1.0.8-mac, items 7 + 9) --------
+    def set_auto_track(self, enabled):
+        """Turn auto-tracking on/off. Returns a short status string."""
+        self.auto_track = bool(enabled)
+        if self.tracker is not None:
+            self.tracker.enabled = self.auto_track
+            if not self.auto_track:
+                self.tracker.stop()
+                self.tracker.enabled = False
+                self.last_tracked_box = None
+                self.last_track_status = "disabled"
+            else:
+                self.tracker.enabled = True
+                self.last_track_status = "idle"
+        return f"Auto-Track: {'ON' if self.auto_track else 'OFF'}."
+
+    def track_me(self, name=None):
+        """'Track me' / 'track this person' voice command.
+
+        With a name, the tracker prefers that person's face once
+        face recognition knows them; without one it follows the
+        largest person in frame. Also (re-)enables auto-track.
+        """
+        self.set_auto_track(True)
+        if self.tracker is not None:
+            self.tracker.set_target(name)
+        if name:
+            return f"Tracking {name} — I'll follow you and keep you centred."
+        return "Tracking you — I'll follow the person in frame and keep them centred."
+
+    def stop_tracking(self):
+        """'Stop tracking' voice command: hold still, stay watching."""
+        if self.tracker is not None:
+            self.tracker.stop()
+        self.auto_track = False
+        self.last_track_status = "disabled"
+        return "Auto-tracking is off. The camera will stay where it is."
+
+    def enrol_current(self, name):
+        """Enrol the face currently in frame under ``name``.
+
+        Used by the GUI 'Enroll face' button and the 'enrol this
+        person as <name>' voice command. Local only — see
+        face_profiles.py.
+        """
+        if face_profiles is None:
+            return "Face enrolment is unavailable (face_profiles.py missing)."
+        frame = self._last_frame
+        if frame is None:
+            return "Enrol failed: the camera isn't running — start camera watch first."
+        return face_profiles.enrol(name, frame)
+
+    def track_status_text(self):
+        """One line for the GUI status/log, e.g. 'Tracking: Lorenza (0.87)'."""
+        if self.last_track_status == "camera_lost":
+            return "Tracking: camera lost — check the PIXY is plugged in."
+        if self.last_track_status in ("disabled",):
+            return "Tracking: off"
+        if self.last_tracked_box is None:
+            if self.last_track_status == "returning":
+                return "Tracking: no person in view — returning to centre."
+            return "Tracking: no person in view."
+        if self.last_identified_name:
+            return (f"Tracking: {self.last_identified_name} "
+                    f"(confidence {self.last_confidence:.2f})")
+        if self.unknown_seen_count >= 5:
+            return ("Tracking: unknown person — seen repeatedly. "
+                    "Ask who it is, then enrol them.")
+        return "Tracking: unknown person"
+
+    def _report_track(self, status):
+        """Call on_track when something changed (or every 2s), thread-safe
+        for the GUI because the GUI wraps it in root.after(0, ...)."""
+        if self.on_track is None:
+            return
+        key = (status.get("action"), self.last_identified_name,
+               self.last_tracked_box is not None)
+        now = time.time()
+        if key != self._last_track_report or now - self._last_track_report_at > 2.0:
+            self._last_track_report = key
+            self._last_track_report_at = now
+            try:
+                self.on_track(dict(status))
+            except Exception:
+                pass
+
     def _loop(self):
         cv2 = _cv2()
         back_sub = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=50, detectShadows=False)
         while self.running:
             frame = self.controller.read()
             if frame is None:
+                # Camera lost: tracker must not move or crash.
+                if self.tracker is not None and self.auto_track:
+                    status = self.tracker.update(None)
+                    self.last_track_status = status["action"]
+                    self.last_tracked_box = None
+                    self._report_track(status)
+                if not self._camera_lost_reported:
+                    self._camera_lost_reported = True
+                    if self.on_alert:
+                        try:
+                            self.on_alert("Camera lost — no frame from the PIXY. "
+                                          "Tracking is holding still; check the camera is plugged in.")
+                        except Exception:
+                            pass
                 time.sleep(0.5)
                 continue
+            self._camera_lost_reported = False
+            self._last_frame = frame
+            self._frame_count += 1
             small = cv2.resize(frame, (640, 360))
             mask = back_sub.apply(small)
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             motion_area = sum(cv2.contourArea(c) for c in contours if cv2.contourArea(c) > 500)
+            # Largest moving blob, scaled back to full-frame pixels,
+            # as the tracker's motion fallback (only used when no
+            # person detector fires).
+            motion_box = None
+            if contours:
+                big = max(contours, key=cv2.contourArea)
+                if cv2.contourArea(big) > 500:
+                    x, y, w, h = cv2.boundingRect(big)
+                    fh, fw = frame.shape[:2]
+                    motion_box = (int(x * fw / 640.0), int(y * fh / 360.0),
+                                  int(w * fw / 640.0), int(h * fh / 360.0))
+            # --- Auto-track + face identification (v1.0.8-mac) ---
+            track_status = {"action": self.last_track_status,
+                            "box": self.last_tracked_box,
+                            "camera_lost": False,
+                            "uvc_ignored": bool(self.tracker.uvc_ignored) if self.tracker else False,
+                            "target_name": self.tracker.target_name if self.tracker else None}
+            if self.tracker is not None and self.auto_track:
+                # Face identification is the expensive step: run it
+                # about once a second, not every frame.
+                identified = []
+                if face_profiles is not None and self._frame_count % 10 == 1:
+                    try:
+                        name, conf, box = face_profiles.identify(frame)
+                        if box is not None:
+                            identified = [(box, name, conf)]
+                        if name:
+                            self.last_identified_name = name
+                            self.last_confidence = conf
+                        elif box is not None:
+                            # A face is in view but matches nobody:
+                            # clear any previous identity, count repeats.
+                            self.last_identified_name = None
+                            self.last_confidence = 0.0
+                            if self._unknown_tracker is not None:
+                                is_repeat, count, _b = self._unknown_tracker.note_unknown(frame, box)
+                                self.unknown_seen_count = count
+                                if is_repeat and self.on_alert:
+                                    try:
+                                        self.on_alert(
+                                            "Camera: an unfamiliar face has been seen repeatedly. "
+                                            "Ask who it is, then say 'enrol this person as <name>'.")
+                                    except Exception:
+                                        pass
+                    except Exception:
+                        pass
+                track_status = self.tracker.update(
+                    frame, motion_box=motion_box, identified_faces=identified or None)
+                self.last_tracked_box = track_status.get("box")
+                self.last_track_status = track_status.get("action", "idle")
+                if self.last_tracked_box is None:
+                    self.last_identified_name = None
+                    self.last_confidence = 0.0
+                    self.unknown_seen_count = 0
+                track_status["name"] = self.last_identified_name
+                track_status["confidence"] = self.last_confidence
+                track_status["unknown_seen_count"] = self.unknown_seen_count
+                self._report_track(track_status)
+            if self.frame_callback is not None:
+                try:
+                    self.frame_callback(frame, track_status)
+                except Exception:
+                    pass
             now = time.time()
             if (self.armed and motion_area > MOTION_MIN_AREA
                     and now - self.last_alert > ALERT_COOLDOWN_SEC):

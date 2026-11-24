@@ -200,9 +200,11 @@ implementation built to match that behaviour, not a copy of Muse.
   ONLINE, tells the user plainly ("That reply timed out after 120
   seconds, so I reset and I'm ready again. Please try once more.")
   and logs it. Oracle never sits on THINKING forever.
-- The Mac GUI does not yet have this watchdog — see the v1.0.6 notes
-  for the Mac port. Do not claim it does until it is added and seen
-  working.
+- Mac port: added in v1.0.8 (in progress, uncommitted) — same 120 s
+  watchdog in `_tick_clock`, same `_ui_queue` (reply delivery via
+  `_post_ui`), same busy-clears rule. Mac wording: "Timed out — I got
+  stuck thinking, please try again." Not yet seen working on a real
+  Mac; do not claim a live test passed until one does.
 
 ## 8. Competency benchmark: Muse's observable behaviour
 

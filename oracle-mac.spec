@@ -42,7 +42,8 @@ a = Analysis(
     hiddenimports=[
         'agent', 'computer', 'voice', 'camera', 'monitor',
         'email_alerts', 'identity', 'repair', 'design3d', 'security',
-        'memory_import', 'PIL', 'PIL.Image', 'PIL.ImageTk',
+        'memory_import', 'tracking', 'face_profiles',
+        'PIL', 'PIL.Image', 'PIL.ImageTk',
     ],
     hookspath=[],
     hooksconfig={},

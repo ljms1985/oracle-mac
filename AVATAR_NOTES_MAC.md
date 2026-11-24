@@ -65,3 +65,26 @@ square portrait to change the face; restart `gui.py`.
 - This is a still image animated with transforms + an overlay, not
   a video avatar — it does not lip-sync to real phonemes, it moves
   in time with the speaking state.
+
+## Hi-res update (2026-11-24, source only — not yet in a released package)
+
+Lorenza: "make the Avatar look cleaner, it's not as high res as I would like."
+
+**What was low-res before:** `assets/avatar.png` / `avatar.png` were
+only **512x512**, and worse, they were the **whole full-body figure on a
+white background** — at the 260 px display size the face itself was only
+~70 px wide, and the white box showed on the dark console.
+
+**What changed:**
+- Asset replaced with the **head+shoulders crop (740x680, transparent
+  background)** cut from the 1600x1600 source — same framing as Windows.
+- `gui.py`: avatar render **260 → 420 px**, core canvas **300 → 480 px**,
+  face re-centred (cy 138 → 210), aura scaled, waveform moved down,
+  sharpening after resize (Sharpness 1.25, Contrast 1.05), mouth overlay
+  scaled 1.615x with the same height clamp as Windows, avatar-only
+  window enlarged to 440x400.
+- Character design unchanged.
+
+**Test:** Xvfb smoke test on Linux — GUI opens, avatar loads at 420x386,
+blink frame 420x55, animation runs, no white box. **Not tested on a real
+Mac** (same as all Mac work so far).
