@@ -144,6 +144,17 @@ class OracleGUI:
         self.always_listen = False
         self.speak_replies = True
         self.busy = False
+        # --- Fluid lip-sync state (v1.0.6, ported from Windows) ---
+        self.lip_level = 0.0
+        self._lip_target_level = 0.0
+        self._lip_shape = "closed"
+        self._typing_done = False
+        self._speech_done = True
+        # --- Avatar-only mode state (v1.0.6) ---
+        self.avatar_win = None
+        self._avatar_mode = False
+        self._avatar_drag = None
+        self._load_key_from_keychain()
         self.listen_thread = None
         self.watcher = None
         self.camera_controller = None
@@ -156,6 +167,11 @@ class OracleGUI:
 
         self._build_top()
         self._build_main()
+        self._refresh_api_key_label()
+        try:
+            self.root.bind("<Unmap>", self._on_unmap)
+        except Exception:
+            pass
         self.animate()
         self._tick_clock()
 
@@ -291,6 +307,19 @@ class OracleGUI:
         deck_canvas.bind_all("<Button-4>", lambda e: deck_canvas.yview_scroll(-1, "units"))
         deck_canvas.bind_all("<Button-5>", lambda e: deck_canvas.yview_scroll(1, "units"))
 
+        # API KEY card — first in the left deck, visible on first open
+        # (v1.0.6). The key itself is NEVER shown; only SET / NOT SET
+        # and the last 4 characters. On Mac the key lives in the
+        # macOS Keychain, not in source code, logs, or email.
+        key_card = self._card(deck, "🔑  API KEY")
+        self.api_key_label = tk.Label(key_card, text="Key: …", font=("Helvetica Neue", 9, "bold"),
+                                      fg=t["muted"], bg=t["panel"])
+        self.api_key_label.pack(anchor="w", pady=(2, 4))
+        self._btn(key_card, "Change API Key", self._show_api_key_dialog).pack(fill="x", pady=2)
+        tk.Label(key_card, text="Saved in your Mac Keychain only. Never in source code, logs, or email.",
+                 font=("Helvetica Neue", 8), fg=t["muted"], bg=t["panel"],
+                 wraplength=200, justify="left").pack(anchor="w", pady=(2, 0))
+
         voice_card = self._card(deck, "◇  VOICE")
         self.listen_btn = self._btn(voice_card, "Always listen: OFF", self.toggle_listen)
         self.listen_btn.pack(fill="x", pady=2)
@@ -318,6 +347,7 @@ class OracleGUI:
         ptz.grid_columnconfigure(1, weight=1)
         priv = self._btn(cam_card, "Privacy mode", self.camera_privacy)
         priv.pack(fill="x", pady=2)
+        self._btn(cam_card, "Test camera (grab a frame)", self.test_camera_gui).pack(fill="x", pady=2)
         self.cam_label = tk.Label(cam_card, text="Camera: OFF", font=("Helvetica Neue", 9, "bold"),
                                   fg=t["muted"], bg=t["panel"])
         self.cam_label.pack(anchor="w", pady=(4, 0))
@@ -337,6 +367,7 @@ class OracleGUI:
 
         sys_card = self._card(deck, "⚙  SYSTEM")
         self._btn(sys_card, "Check for improvements", self.check_improvements).pack(fill="x", pady=2)
+        self._btn(sys_card, "Avatar only  ◐", self._enter_avatar_only).pack(fill="x", pady=2)
         self._btn(sys_card, "Switch theme  ◐", self.switch_theme).pack(fill="x", pady=2)
         tk.Label(sys_card, text="Proposals never apply without a clear YES, by email or in this GUI.",
                  font=("Helvetica Neue", 8), fg=t["muted"], bg=t["panel"],
@@ -407,6 +438,11 @@ class OracleGUI:
     # ------------------------------------------------------------ animation
     def animate(self):
         self.phase += 0.12
+        # Ease the mouth towards the live speech level (v1.0.6).
+        target = self._lip_target_level if self.mode == "speaking" else 0.0
+        self.lip_level += (target - self.lip_level) * (0.45 if target > self.lip_level else 0.25)
+        if abs(target - self.lip_level) < 0.01:
+            self.lip_level = target
         t = self.t
         c = self.canvas
         try:
@@ -447,14 +483,13 @@ class OracleGUI:
             ax, ay = hx + look_x, hy + look_y
             photo = self.avatar_blink_photo if (blinking and self.avatar_blink_photo is not None) else self.avatar_photo
             c.create_image(ax, ay, image=photo)
-            # Mouth overlay while speaking: dark oval over the
-            # avatar's mouth area (mouth sits ~30% below centre on
-            # this portrait), opening/closing with the voice.
+            # Mouth overlay while speaking: fluid lip-sync (v1.0.6),
+            # driven by the real speech level + phoneme shape.
             # Idle: no overlay, the avatar's own mouth shows.
             if self.mode == "speaking":
                 mouth_cy = ay + 38
-                mouth_h = 5 + abs(math.sin(self.phase * 3.1)) * 10 + random.uniform(0, 4)
-                c.create_oval(ax - 20, mouth_cy - mouth_h, ax + 20, mouth_cy + mouth_h,
+                mw, mh = self._mouth_dims()
+                c.create_oval(ax - mw, mouth_cy - mh, ax + mw, mouth_cy + mh,
                               fill="#08101f", outline=t["accent2"], width=1)
             elif self.mode == "thinking":
                 c.create_line(ax - 14, ay + 38, ax + 14, ay + 38, fill=t["accent"], width=2)
@@ -495,8 +530,7 @@ class OracleGUI:
                               fill=t["accent2"], width=2)
             mouth_cy = hy + 48
             if self.mode == "speaking":
-                mouth_h = 8 + abs(math.sin(self.phase * 3.1)) * 16 + random.uniform(0, 7)
-                mouth_w = 30
+                mouth_w, mouth_h = self._mouth_dims()
                 c.create_oval(hx - mouth_w, mouth_cy - mouth_h, hx + mouth_w, mouth_cy + mouth_h,
                               fill="#08101f", outline=t["accent2"], width=2)
                 c.create_oval(hx - mouth_w * 0.55, mouth_cy + mouth_h * 0.25,
@@ -508,13 +542,13 @@ class OracleGUI:
                 c.create_arc(hx - 26, mouth_cy - 12, hx + 26, mouth_cy + 14,
                              start=200, extent=140, outline=t["accent"], width=2, style="arc")
 
-        # Waveform
+        # Waveform — bars follow the real speech level while speaking
         bars = 52
         for i in range(bars):
             x = cx - 260 + i * 10
             falloff = 1 - abs(i - 26) / 32
             if self.mode == "speaking":
-                bh = random.uniform(14, 58) * falloff
+                bh = (10 + self.lip_level * 55 + random.uniform(0, 6)) * falloff
             elif self.mode == "thinking":
                 bh = 14 + abs(math.sin(self.phase + i * 0.4)) * 26 * falloff
             else:
@@ -530,7 +564,259 @@ class OracleGUI:
                                    fg=t["warn"] if self.mode == "thinking" else t["accent"])
         except Exception:
             pass
-        self.root.after(50, self.animate)
+        self.root.after(33, self.animate)  # ~30 fps for smooth lip-sync
+
+    # ------------------------------------------------------------ speech / lip-sync (v1.0.6)
+    def _mouth_dims(self):
+        level = self.lip_level if self.mode == "speaking" else 0.0
+        shape = self._lip_shape if self.mode == "speaking" else "closed"
+        if shape == "closed" or level < 0.04:
+            return (7, 1)
+        if shape == "slight":
+            return (10, 2 + level * 4)
+        if shape == "wide":
+            return (16, 4 + level * 13)
+        if shape == "round":
+            return (8, 5 + level * 11)
+        return (12, 3 + level * 9)
+
+    def _on_speech_level(self, level, shape):
+        self._lip_target_level = max(0.0, min(1.0, float(level)))
+        self._lip_shape = shape if shape in ("closed", "slight", "open", "wide", "round") else "open"
+
+    def _on_speech_done(self):
+        self._speech_done = True
+        self._lip_target_level = 0.0
+        self._lip_shape = "closed"
+        self._maybe_finish_speaking()
+
+    def _maybe_finish_speaking(self):
+        if self._typing_done and self._speech_done and self.busy:
+            self.mode = "idle"
+            self.busy = False
+            try:
+                self.status.config(text="● ONLINE", fg=self.t["good"])
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------ API key (v1.0.6, Keychain on Mac)
+    def _api_key_status_text(self):
+        key = os.environ.get("OPENAI_API_KEY", "")
+        if not key:
+            return "Key: NOT SET"
+        return f"Key: SET  •  ****…{key[-4:]}"
+
+    def _refresh_api_key_label(self):
+        try:
+            self.api_key_label.config(text=self._api_key_status_text())
+        except Exception:
+            pass
+
+    def _load_key_from_keychain(self):
+        """Load the key from macOS Keychain into this process only.
+        The key value is never printed or logged."""
+        try:
+            import subprocess
+            out = subprocess.run(
+                ["security", "find-generic-password", "-a", "Oracle",
+                 "-s", "Oracle-OpenAI-API-Key", "-w"],
+                capture_output=True, text=True, timeout=10)
+            if out.returncode == 0 and out.stdout.strip():
+                os.environ["OPENAI_API_KEY"] = out.stdout.strip()
+        except Exception:
+            pass
+
+    def _save_key_to_keychain(self, key):
+        import subprocess
+        subprocess.run(["security", "delete-generic-password", "-a", "Oracle",
+                        "-s", "Oracle-OpenAI-API-Key"],
+                       capture_output=True, timeout=10)
+        subprocess.run(["security", "add-generic-password", "-a", "Oracle",
+                        "-s", "Oracle-OpenAI-API-Key", "-w", key],
+                       capture_output=True, timeout=10, check=True)
+
+    def _show_api_key_dialog(self):
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Change API Key")
+        dlg.geometry("460x240")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        tk.Label(dlg, text="Paste your new OpenAI API key below.",
+                 font=("Helvetica Neue", 11, "bold")).pack(anchor="w", padx=16, pady=(14, 4))
+        tk.Label(dlg, text="It is checked with a quick test call, then saved in your\n"
+                 "macOS Keychain only — never in source code, logs, email,\nor GitHub. The running agent uses it at once.",
+                 font=("Helvetica Neue", 9), justify="left").pack(anchor="w", padx=16, pady=(0, 8))
+        entry = tk.Entry(dlg, font=("Helvetica Neue", 11), show="*", width=42)
+        entry.pack(padx=16, fill="x")
+        entry.focus_set()
+        status = tk.Label(dlg, text=self._api_key_status_text(),
+                          font=("Helvetica Neue", 9, "bold"))
+        status.pack(anchor="w", padx=16, pady=(10, 4))
+        btns = tk.Frame(dlg)
+        btns.pack(padx=16, pady=8, fill="x")
+        save_btn = tk.Button(btns, text="Save key", font=("Helvetica Neue", 10, "bold"))
+        save_btn.pack(side="left", padx=(0, 8))
+        tk.Button(btns, text="Cancel", font=("Helvetica Neue", 10),
+                  command=dlg.destroy).pack(side="left")
+
+        def _do_save():
+            new_key = entry.get().strip()
+            if not new_key:
+                status.config(text="Paste a key first.", fg="red")
+                return
+            save_btn.config(state="disabled")
+            status.config(text="Validating the key with OpenAI…", fg="black")
+            def _run():
+                ok, msg = self._validate_api_key(new_key)
+                if ok:
+                    try:
+                        self._save_key_to_keychain(new_key)
+                    except Exception as e:
+                        self.root.after(0, lambda: status.config(
+                            text=f"Key is valid but Keychain save failed: {e}", fg="red"))
+                        self.root.after(0, lambda: save_btn.config(state="normal"))
+                        return
+                    os.environ["OPENAI_API_KEY"] = new_key
+                    self.root.after(0, lambda: self._api_key_saved(dlg))
+                else:
+                    self.root.after(0, lambda: (status.config(text=f"Key invalid — {msg}", fg="red"),
+                                                save_btn.config(state="normal")))
+            threading.Thread(target=_run, daemon=True).start()
+        save_btn.config(command=_do_save)
+        dlg.bind("<Return>", lambda _e: _do_save())
+
+    def _api_key_saved(self, dlg):
+        self._refresh_api_key_label()
+        self.append("system", "API key updated — the new key is active now. (The key itself is never shown here.)")
+        dlg.after(1200, dlg.destroy)
+
+    @staticmethod
+    def _validate_api_key(key):
+        import json as _json
+        import urllib.request as _url
+        try:
+            req = _url.Request(
+                "https://api.openai.com/v1/chat/completions",
+                data=_json.dumps({
+                    "model": "gpt-4o-mini",
+                    "messages": [{"role": "user", "content": "Reply with the single word Pineapple."}],
+                    "max_tokens": 5,
+                }).encode(),
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            )
+            with _url.urlopen(req, timeout=25) as resp:
+                data = _json.loads(resp.read())
+            text = data["choices"][0]["message"]["content"].strip()
+            return True, "ok"
+        except Exception as e:
+            return False, f"OpenAI rejected it ({e}). Check the key and try again."
+
+    # ------------------------------------------------------------ avatar-only mode (v1.0.6)
+    def _on_unmap(self, event):
+        try:
+            if event.widget is self.root and self.root.state() == "iconic" and not self._avatar_mode:
+                self._enter_avatar_only()
+        except Exception:
+            pass
+
+    def _enter_avatar_only(self):
+        if self._avatar_mode:
+            return
+        self._avatar_mode = True
+        try:
+            self.root.withdraw()
+        except Exception:
+            pass
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.geometry("280x300+200+200")
+        self.avatar_win = win
+        canvas = tk.Canvas(win, width=280, height=260, bg=self.t["bg"],
+                           highlightthickness=0)
+        canvas.pack(fill="both", expand=True)
+        self._avatar_canvas = canvas
+        if self.avatar_photo is not None:
+            canvas.create_image(140, 130, image=self.avatar_photo, tags="avatar")
+        else:
+            canvas.create_oval(60, 30, 220, 230, fill=self.t["panel2"],
+                               outline=self.t["accent"], width=2)
+        restore = tk.Button(win, text="⤢  Restore full window",
+                            font=("Helvetica Neue", 9, "bold"),
+                            command=self._restore_from_avatar)
+        restore.pack(fill="x")
+        def _press(e):
+            self._avatar_drag = (e.x_root, e.y_root, win.winfo_x(), win.winfo_y(), False)
+        def _drag(e):
+            if self._avatar_drag is None:
+                return
+            x0, y0, wx, wy, _moved = self._avatar_drag
+            if abs(e.x_root - x0) > 5 or abs(e.y_root - y0) > 5:
+                self._avatar_drag = (x0, y0, wx, wy, True)
+            win.geometry(f"+{wx + e.x_root - x0}+{wy + e.y_root - y0}")
+        def _release(_e):
+            if self._avatar_drag is not None and not self._avatar_drag[4]:
+                self._restore_from_avatar()
+            self._avatar_drag = None
+        canvas.bind("<Button-1>", _press)
+        canvas.bind("<B1-Motion>", _drag)
+        canvas.bind("<ButtonRelease-1>", _release)
+        self._avatar_only_animate()
+
+    def _avatar_only_animate(self):
+        if not self._avatar_mode or self.avatar_win is None:
+            return
+        try:
+            target = self._lip_target_level if self.mode == "speaking" else 0.0
+            self.lip_level += (target - self.lip_level) * (0.45 if target > self.lip_level else 0.25)
+            c = self._avatar_canvas
+            c.delete("mouth")
+            if self.mode == "speaking":
+                mw, mh = self._mouth_dims()
+                c.create_oval(140 - mw, 168 - mh, 140 + mw, 168 + mh,
+                              fill="#40160f", outline="", tags="mouth")
+            self.avatar_win.after(33, self._avatar_only_animate)
+        except Exception:
+            pass
+
+    def _restore_from_avatar(self):
+        if self.avatar_win is not None:
+            try:
+                self.avatar_win.destroy()
+            except Exception:
+                pass
+            self.avatar_win = None
+        self._avatar_mode = False
+        try:
+            self.root.deiconify()
+            self.root.state("normal")
+            self.root.focus_force()
+        except Exception:
+            pass
+
+    def test_camera_gui(self):
+        if camera_mod is None:
+            self.append("system", "camera.py not found, or OpenCV is not installed.")
+            return
+        self.append("system", "Testing camera — trying every camera index and backend until one returns a real frame…")
+        def _run():
+            try:
+                ctrl = camera_mod.CameraController()
+                ctrl.open()
+                frame = ctrl.read()
+                if frame is None:
+                    self.root.after(0, lambda: self.append("system", "Camera test failed: opened but returned no frame."))
+                    return
+                import cv2 as _cv
+                from pathlib import Path as _P
+                out = _P(__file__).resolve().parent / "alerts" / "test-frame.jpg"
+                out.parent.mkdir(exist_ok=True)
+                _cv.imwrite(str(out), frame)
+                ctrl.close()
+                self.root.after(0, lambda: self.append("system", f"Camera works — a real frame was grabbed and saved at: {out}"))
+            except Exception as e:
+                self.root.after(0, lambda err=e: self.append("system", f"Camera test failed: {err}"))
+        threading.Thread(target=_run, daemon=True).start()
 
     # ------------------------------------------------------------ actions
     def toggle_speak(self):
@@ -676,6 +962,8 @@ class OracleGUI:
         if self.busy:
             return
         self.busy = True
+        self._typing_done = False
+        self._speech_done = False
         self.append("user", user_text + ("  [spoken]" if spoken else ""))
         self.history.append({"role": "user", "content": user_text})
         self.mode = "thinking"
@@ -700,7 +988,13 @@ class OracleGUI:
             self.mode = "speaking"
             self.status.config(text="● SPEAKING", fg=self.t["accent"])
             if self.speak_replies and voice_mod is not None:
-                voice_mod.speak_async(full_text)
+                voice_mod.speak_async(
+                    full_text,
+                    on_level=self._on_speech_level,
+                    on_done=lambda: self.root.after(0, self._on_speech_done),
+                )
+            else:
+                self._speech_done = True
             self.text.configure(state="normal")
             self.text.insert("end", f"{AGENT_NAME}: ", "oracle")
             self.text.configure(state="disabled")
@@ -715,9 +1009,8 @@ class OracleGUI:
             self.text.configure(state="normal")
             self.text.insert("end", "\n\n")
             self.text.configure(state="disabled")
-            self.mode = "idle"
-            self.busy = False
-            self.status.config(text="● ONLINE", fg=self.t["good"])
+            self._typing_done = True
+            self._maybe_finish_speaking()
 
 
 if __name__ == "__main__":

@@ -18,9 +18,6 @@ So this module uses three layers, in order:
      We TRY this, report success/failure honestly, and fall back if
      the PIXY ignores it (which it may, since EMEET routes PTZ
      through EMEET Studio).
-     We TRY this, report success/failure honestly, and fall back if
-     the PIXY ignores it (which it may, since EMEET routes PTZ
-     through Studio).
   3. Digital PTZ - crop + zoom inside a 1080p/4K frame. This always
      works for framing, even if the motor does not move. It is not
      the same as physically rotating, and the code says so.
@@ -52,6 +49,17 @@ Install on macOS:
 
 Run alone for a test:
   python camera.py
+
+Opening a camera (CameraController.open): enumerates indexes 0..3
+with backends [CAP_AVFOUNDATION, CAP_ANY] (macOS has no
+DirectShow/MSMF), trying resolutions 1920x1080 / 1280x720 /
+640x480. A candidate only counts if a REAL frame is read -
+isOpened() alone is not enough, it can lie on macOS. What worked
+is recorded in controller.open_info (index, backend, width,
+height); the last failure is in controller.last_error, which a
+successful open clears. On macOS also check System Settings >
+Privacy & Security > Camera and allow Terminal / your Python app
+to use the camera - a denied permission looks like "no camera".
 """
 
 import base64
@@ -86,6 +94,13 @@ class CameraController:
     def __init__(self, index=CAMERA_INDEX):
         self.index = index
         self.cap = None
+        # What actually opened, and the last failure - see open().
+        # open_info: {"index": int, "backend": str, "width": int,
+        #             "height": int} once a camera is open, {} before.
+        # last_error: "" after a successful open, otherwise a short
+        # human-readable reason the last candidate failed.
+        self.open_info = {}
+        self.last_error = ""
         self.pan = 0
         self.tilt = 0
         self.zoom = 1.0
@@ -93,24 +108,69 @@ class CameraController:
         self.crop_x = 0.5
         self.crop_y = 0.5
 
-    def open(self):
+    def open(self, index=None):
+        """Open a camera, robustly.
+
+        Tries the requested index first (default: this controller's
+        index, from CAMERA_INDEX), then every other index 0..3. For
+        each index, tries backends [CAP_AVFOUNDATION, CAP_ANY], and
+        for each backend tries resolutions 1920x1080, 1280x720,
+        640x480. A candidate only counts if a real frame is read.
+        On success sets self.index / self.cap / self.open_info and
+        CLEARS self.last_error. On total failure releases everything,
+        leaves self.cap None, records the reason in self.last_error,
+        and raises RuntimeError with that reason.
+        """
         cv2 = _cv2()
-        # CAP_AVFOUNDATION is the macOS AVFoundation backend -
-        # the macOS equivalent of DirectShow, best for UVC PTZ here.
-        backend = getattr(cv2, "CAP_AVFOUNDATION", 0)
-        self.cap = cv2.VideoCapture(self.index, backend) if backend else cv2.VideoCapture(self.index)
-        if not self.cap.isOpened():
-            self.cap = cv2.VideoCapture(self.index)
-        if not self.cap.isOpened():
-            raise RuntimeError(
-                f"Could not open camera index {self.index}. Check it is plugged in "
-                "and not in use by EMEET Studio / Zoom / OBS. On macOS also check "
-                "System Settings > Privacy & Security > Camera and allow Terminal / "
-                "your Python app to use the camera.")
-        # 1080p for speed; 4K is available but much heavier for motion + vision.
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-        return True
+        wanted = self.index if index is None else index
+        order = [wanted] + [i for i in range(4) if i != wanted]
+        backends = []
+        if hasattr(cv2, "CAP_AVFOUNDATION"):
+            backends.append((cv2.CAP_AVFOUNDATION, "CAP_AVFOUNDATION"))
+        backends.append((cv2.CAP_ANY, "CAP_ANY"))
+        resolutions = [(1920, 1080), (1280, 720), (640, 480)]
+        failures = []
+        for idx in order:
+            for backend, backend_name in backends:
+                for width, height in resolutions:
+                    cap = cv2.VideoCapture(idx, backend)
+                    try:
+                        if not cap.isOpened():
+                            failures.append(f"index {idx} {backend_name} {width}x{height}: not opened")
+                            cap.release()
+                            continue
+                        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+                        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+                        ok, frame = cap.read()
+                        if not ok or frame is None or frame.size == 0:
+                            failures.append(f"index {idx} {backend_name} {width}x{height}: opened but no frame")
+                            cap.release()
+                            continue
+                        # Real frame read - this candidate counts.
+                        actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or width)
+                        actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or height)
+                        self.close()
+                        self.index = idx
+                        self.cap = cap
+                        self.open_info = {"index": idx, "backend": backend_name,
+                                          "width": actual_w, "height": actual_h}
+                        self.last_error = ""
+                        return True
+                    except Exception as e:
+                        failures.append(f"index {idx} {backend_name} {width}x{height}: {e}")
+                        try:
+                            cap.release()
+                        except Exception:
+                            pass
+        self.cap = None
+        self.open_info = {}
+        detail = failures[-1] if failures else "no camera candidate tried"
+        self.last_error = (
+            f"Could not open any camera (indexes 0..3). Last failure: {detail}. "
+            "Check it is plugged in and not in use by EMEET Studio / Zoom / OBS. "
+            "On macOS also check System Settings > Privacy & Security > Camera "
+            "and allow Terminal / your Python app to use the camera.")
+        raise RuntimeError(self.last_error)
 
     def read(self):
         if self.cap is None:
@@ -136,6 +196,7 @@ class CameraController:
         if self.cap is not None:
             self.cap.release()
             self.cap = None
+        self.open_info = {}
 
     # -- PTZ: try UVC first, report honestly if it is ignored ------------
     def ptz(self, pan_delta=0, tilt_delta=0, zoom_delta=0.0):
