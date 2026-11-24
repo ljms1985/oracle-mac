@@ -848,9 +848,43 @@ class OracleGUI:
             return
         self.append("system", "What I remember about Lorenza:\n" + "\n".join(lines))
 
+    def _load_bundled_key(self):
+        """Load a bundled API key if one was injected into this copy.
+
+        v1.0.9: a private copy of Oracle (never a public release) may
+        carry `oracle-key.env` next to the .app / exe, in the bundle
+        Resources folder, or next to gui.py. If present, and no key is
+        already set, read it into this process only. The key value is
+        never printed, logged, or written anywhere else.
+        """
+        if os.environ.get("OPENAI_API_KEY"):
+            return
+        candidates = []
+        try:
+            exe_dir = Path(sys.executable).resolve().parent
+            candidates.append(exe_dir / "oracle-key.env")
+            candidates.append(exe_dir.parent / "Resources" / "oracle-key.env")
+        except Exception:
+            pass
+        candidates.append(Path(__file__).resolve().parent / "oracle-key.env")
+        for path in candidates:
+            try:
+                if not path.is_file():
+                    continue
+                text = path.read_text(encoding="utf-8", errors="ignore").strip()
+                if text.startswith("OPENAI_API_KEY="):
+                    text = text[len("OPENAI_API_KEY="):].strip().strip('"').strip("'")
+                if len(text) >= 20:
+                    os.environ["OPENAI_API_KEY"] = text
+                    print("[api key] Bundled key loaded (value not shown).")
+                    return
+            except Exception:
+                continue
+
     def _load_key_from_keychain(self):
         """Load the key from macOS Keychain into this process only.
         The key value is never printed or logged."""
+        self._load_bundled_key()
         try:
             import subprocess
             out = subprocess.run(

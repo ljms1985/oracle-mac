@@ -17,5 +17,9 @@ faces/
 identities/
 alerts/
 
+# Bundled API key (oracle-key.env) — injected only into a private
+# copy of the app, NEVER committed, NEVER in a GitHub release.
+oracle-key.env
+
 # macOS
 .DS_Store
