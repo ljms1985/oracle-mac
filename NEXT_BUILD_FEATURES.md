@@ -27,6 +27,7 @@ tested in the build. If any item is missing, the build is not complete.**
 | 13 | **AI/ML design + hardware tuning** — `AI_DESIGN.md` and `HARDWARE.md`: LLM reasoning with tool calling, multi-turn context with summarising, persistent memory, local-only voice/face learning, speech/vision, self-improvement that explains and waits for a yes, timeouts/watchdogs; tuned for **Ryzen 9 9950X3D / RTX 4080 Super (16GB VRAM, CUDA) / 64GB RAM** (NOT 128 — she removed two sticks) | DONE in v1.0.6 (Windows hardware). **Mac note:** the Mac `HARDWARE.md` was missing from the Mac repo until v1.0.8-mac (in progress) — added then, adapted for Mac. The Ryzen / RTX 4080 Super / 64 GB tuning in this row is the **Windows PC's** hardware, NOT the Mac's: the Mac doc states plainly that Mac tuning is the Mac's own CPU/GPU, with no RTX 4080 Super and no CUDA on a Mac. |
 | 14 | **Muse conversation memory import** — Oracle inherits what Muse did with her on the PC: import path for Muse chat exports (.md/.json/.txt) into Oracle's persistent memory (deduped, dated, sourced); startup auto-import from a `memory_import/` folder; MEMORY card in the left deck (Import / What do you remember?); imported memory prepended to every reply's system prompt so Oracle can reference it naturally ("you told Muse on Nov 20 that…") and continue those open threads. **Muse-to-Oracle sharing via the private Tailscale/SSH tunnel is explicitly authorized by Lorenza 2026-11-24** — scope is Muse→Oracle only, local on her PC; never GitHub, email to anyone but Lorenza, or any public place. Imported memory stays local; log imports without credential values. Transfer the seed only via the SSH tunnel, never GitHub/email. | Code DONE in v1.0.7 (see State below). Seed file: `~/workspace/oracle-memory-seed/muse-memory-seed.md` (85 facts, 15 OPEN, no key values) — **not in any repo, not emailed** |
 | 15 | **Job-hunting auto-submit** — submit applications on its own (fill the form, press submit, push through every time a site is NOT blocking it, without asking first); stop and hand to Lorenza only if actually blocked (CAPTCHA, sign-in code/2FA, anti-bot block, step needing a human). Follow through to the employer's own site when Indeed/another job site redirects there. If an account is required, create a username/password, saved locally only, distinct per site, recorded where she can see it, AND opened in Notepad left up on the desktop (`~/Desktop/Oracle-Accounts.txt`, appended not overwritten). | DONE in v1.0.6 (per build record — re-verify at next release) |
+| 17 | **Pan-and-describe ('what do you see')** — on 'what do you see' / 'describe what you see' / 'look around' / 'scan the room', the camera pans left -> right then right -> left, capturing frames at each stop, and describes EVERYTHING seen across the whole sweep in one coherent spoken left-to-right description (vision, OpenAI via key on the machine). Physical UVC pan first; digital pan fallback (zoom 1.5x + crop slide) when the PIXY ignores UVC PTZ, stated honestly. Camera returns to its starting position; camera watch stays ON through the sweep, only auto-tracking pauses. Frames + description saved under alerts/pan-YYYYMMDD-HHMMSS/. | DONE in source 2026-11-24, **verified live on the PC** (two sweeps: 10 frames each, full descriptions; GUI intercept verified: ASK OK 'what do you see' -> 1724-char reply). Mac code ported, **not tested on a real Mac**. |
 | 16 | **Windows/Mac parity** — everything built for one version must also be in the other, same capabilities on both | Ongoing rule. Known Mac gaps to close: items 4 and 12 above; Mac builds are NOT tested on a real Mac — state that plainly |
 
 ## State at deferral (2026-11-24 ~18:06 EST)
@@ -71,6 +72,62 @@ once, silence gate. Verified on the Windows PC only — Mac side is
 code-only, NOT tested on a real Mac. See Windows checklist for test
 results. Still to do: Lorenza speaking test sentences directly to
 the PC.
+
+## Camera watch ALWAYS ON + live preview box — done in source 2026-11-24 ~18:35 EST (after deferral)
+
+Same change as Windows (mirrored in Mac `gui.py`, same behaviour,
+Mac logging via `oracle-gui.log` instead of `voice-listening.log`,
+auto-track re-enabled in `_apply_watch_on`): watch starts at launch
+in a worker thread, retries every 30 s on failure, Stop/Privacy
+stops the retry loop; small 232×152 live preview box in the lower
+right corner, same feed as watch, refreshed every 200 ms. Verified
+live on the Windows PC only — Mac side is code-only, NOT tested on
+a real Mac. See Windows checklist for the live test + screenshot.
+
+## v1.0.10 — Mac API-key fix (2026-11-24 evening, Candice's report)
+
+Candice called Lorenza: v1.0.9 on her Intel Mac opens but the API key
+"didn't take" — body, no brain. Root cause, traced in code (no log
+from her Mac exists, so the exact step she took is unconfirmed):
+- The key was NEVER actually in the app she downloaded. The public
+  v1.0.9-intel DMG/ZIP is key-free by design; the key only travelled
+  as a separate oracle-key.env attachment, so a manual step was
+  always required — it was never out-of-the-box.
+- v1.0.9's loader only looked inside the bundle (Contents/MacOS,
+  Contents/Resources). A key file next to Oracle.app, in Downloads
+  (where a Gmail attachment lands), on the Desktop, or in a local
+  fallback file was never seen.
+- v1.0.9's paste box validated the raw paste: pasting the whole
+  `OPENAI_API_KEY=sk-...` line from the file failed validation.
+- v1.0.9's Keychain load ran AFTER the bundled load and overwrote
+  it unconditionally, so any stale Keychain entry clobbered a good
+  bundled key. And if the Keychain save failed (macOS prompt
+  denied), the dialog lost the key entirely — no fallback, no
+  in-session key.
+- The v1.0.9 drop-in step (Show Package Contents > Resources) also
+  breaks the ad-hoc codesign seal and is defeated by App
+  Translocation when the app is launched from the DMG/Downloads.
+
+v1.0.10 fix (gui.py): key search now covers bundle, Resources
+(_MEIPASS), next to Oracle.app, ~/Library/Application Support/
+Oracle/oracle-key.env, ~/Downloads, ~/Desktop; paste/import strips
+the `OPENAI_API_KEY=` prefix and quotes; Keychain is read ONLY if
+no key is set yet and never overwrites one; a validated key that
+Keychain refuses is saved to the local 0600 fallback file instead
+of being lost; new "Import key file…" button in the API Key dialog
+(file picker, no copy/paste, no bundle surgery); startup chat line
+says plainly where the key loaded from. Key still NEVER in the
+repo, releases, email bodies, or logs — presence/length only.
+This build ALSO includes the camera watch auto-on + 232×152 live
+preview box + pan-and-describe code (uncommitted in source at
+v1.0.9 time, now committed) — Mac side code-only, NOT tested on a
+real Mac. Delivery to Candice is the fixed public build + the key
+file by email (private hosted key-injected zip is not available:
+Muse remote-storage rejected the 169 MB file, Google Drive is not
+connected, Gmail caps at 25 MB, and an anyone-with-link URL would
+expose the key) — so one easy step remains: open the app, API Key >
+Import key file, pick the attached oracle-key.env. Not claimed
+out-of-the-box.
 
 ## When the next build starts
 

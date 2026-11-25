@@ -43,6 +43,7 @@ import queue
 import random
 import sys
 import threading
+import time
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
@@ -195,6 +196,10 @@ class OracleGUI:
         self._lip_shape = "closed"
         self._typing_done = False
         self._speech_done = True
+        # Where the active API key came from (v1.0.10): "bundled key
+        # file", "macOS Keychain", "local key file", or None. The key
+        # value itself is never stored here — only the source name.
+        self._key_source = None
         # --- Avatar-only mode state (v1.0.6) ---
         self.avatar_win = None
         self._avatar_mode = False
@@ -237,7 +242,24 @@ class OracleGUI:
             self.always_listen = False
         self.append("system", f"{AGENT_NAME} online. Ask me anything — watch the core light up when I answer.")
         if PROVIDER == "openai" and not os.environ.get("OPENAI_API_KEY"):
-            self.append("system", "Note: OPENAI_API_KEY is not set yet, so replies will fail until you set it on your Mac (see README.md / ORACLE_SETUP_MAC.md) — do not paste the key here.")
+            self.append("system", "Note: OPENAI_API_KEY is not set yet, so replies will fail until you set it on your Mac (see README.md / ORACLE_SETUP_MAC.md) — use the API Key button on the left, or the Import key file button there.")
+        elif PROVIDER == "openai":
+            # v1.0.10: say plainly where the key came from, so a
+            # tester can report it (v1.0.9 only showed "Key: SET" in
+            # a label, and Candice could not tell us what had loaded).
+            src = self._key_source or "a key file or Keychain"
+            self.append("system", f"API key loaded from {src} — {self._api_key_status_text()}. If replies fail, tell Lorenza exactly what this line says.")
+
+        # Camera watch is ALWAYS ON from startup (2026-11-24, Lorenza,
+        # parity with Windows): starts in a worker thread at launch,
+        # retries every 30 s if the camera is busy / fails to open.
+        # _build_cam_preview() adds the small live preview box in
+        # the lower right corner, on the same feed watch is using.
+        self._camera_watch_user_stopped = False
+        self._cam_preview_photo = None
+        self._cam_preview_label = None
+        self._build_cam_preview()
+        self._start_camera_watch_auto()
 
     # ------------------------------------------------------------ avatar
     def _load_avatar(self):
@@ -426,6 +448,7 @@ class OracleGUI:
         priv = self._btn(cam_card, "Privacy mode", self.camera_privacy)
         priv.pack(fill="x", pady=2)
         self._btn(cam_card, "Test camera (grab a frame)", self.test_camera_gui).pack(fill="x", pady=2)
+        self._btn(cam_card, "Pan & describe what you see", self.pan_describe_gui).pack(fill="x", pady=2)
         # Auto-track toggle (v1.0.8-mac, item 7) — default ON.
         self.track_btn = self._btn(cam_card, "Auto-Track: ON", self.toggle_autotrack)
         self.track_btn.pack(fill="x", pady=2)
@@ -848,17 +871,57 @@ class OracleGUI:
             return
         self.append("system", "What I remember about Lorenza:\n" + "\n".join(lines))
 
-    def _load_bundled_key(self):
-        """Load a bundled API key if one was injected into this copy.
+    @staticmethod
+    def _parse_key_text(text):
+        """Extract an OpenAI key from pasted / file text.
 
-        v1.0.9: a private copy of Oracle (never a public release) may
-        carry `oracle-key.env` next to the .app / exe, in the bundle
-        Resources folder, or next to gui.py. If present, and no key is
-        already set, read it into this process only. The key value is
-        never printed, logged, or written anywhere else.
+        Accepts a bare key, or a whole `OPENAI_API_KEY=sk-...` line
+        (the v1.0.9 paste box did NOT strip that prefix, so pasting
+        the full line from oracle-key.env failed validation — that
+        was one of the ways Candice's key "didn't take"). Returns
+        the key, or "" when nothing usable is found. Never logs it.
         """
-        if os.environ.get("OPENAI_API_KEY"):
-            return
+        if not text:
+            return ""
+        for line in str(text).replace("\r", "\n").split("\n"):
+            line = line.strip().strip('"').strip("'").strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line and line.split("=", 1)[0].strip().upper() in (
+                    "OPENAI_API_KEY", "OPENAI_KEY", "API_KEY"):
+                line = line.split("=", 1)[1].strip().strip('"').strip("'").strip()
+            # A pasted key may have trailing junk after whitespace.
+            line = line.split()[0] if line.split() else ""
+            if len(line) >= 20 and line.startswith("sk-"):
+                return line
+        return ""
+
+    def _local_key_path(self):
+        """Persistent local key file (fallback when Keychain fails).
+
+        ~/Library/Application Support/Oracle/oracle-key.env, written
+        0600. Local only, never in the repo / GitHub / email / logs.
+        """
+        return (Path.home() / "Library" / "Application Support"
+                / "Oracle" / "oracle-key.env")
+
+    def _save_key_locally(self, key):
+        path = self._local_key_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"OPENAI_API_KEY={key}\n", encoding="utf-8")
+        try:
+            os.chmod(path, 0o600)
+        except Exception:
+            pass
+        return path
+
+    def _key_search_paths(self):
+        """Everywhere a bundled / supplied oracle-key.env may live,
+        in priority order. v1.0.9 only checked the bundle itself, so
+        a key file sitting next to Oracle.app, in Downloads (where
+        a Gmail attachment lands), on the Desktop, or in the local
+        fallback file was never seen — and the key "didn't take".
+        """
         candidates = []
         try:
             exe_dir = Path(sys.executable).resolve().parent
@@ -866,25 +929,67 @@ class OracleGUI:
             candidates.append(exe_dir.parent / "Resources" / "oracle-key.env")
         except Exception:
             pass
-        candidates.append(Path(__file__).resolve().parent / "oracle-key.env")
-        for path in candidates:
+        candidates.append(RESOURCE_DIR / "oracle-key.env")
+        candidates.append(BASE_DIR / "oracle-key.env")
+        # Next to Oracle.app (e.g. /Applications) — survives reinstalls.
+        try:
+            candidates.append(APP_DIR / "oracle-key.env")
+        except Exception:
+            pass
+        candidates.append(self._local_key_path())
+        candidates.append(Path.home() / "Downloads" / "oracle-key.env")
+        candidates.append(Path.home() / "Desktop" / "oracle-key.env")
+        # De-duplicate, keeping order.
+        seen, out = set(), []
+        for p in candidates:
+            try:
+                key = str(p)
+            except Exception:
+                continue
+            if key not in seen:
+                seen.add(key)
+                out.append(p)
+        return out
+
+    def _load_bundled_key(self):
+        """Load a bundled / supplied API key if one is present.
+
+        v1.0.10: a private copy of Oracle (never a public release)
+        may carry `oracle-key.env` in the bundle, next to the .app,
+        in Downloads / on the Desktop, or in the local fallback
+        file. First valid key wins. The key value is never printed,
+        logged, or written anywhere else.
+        """
+        if os.environ.get("OPENAI_API_KEY"):
+            self._key_source = "environment"
+            return True
+        for path in self._key_search_paths():
             try:
                 if not path.is_file():
                     continue
-                text = path.read_text(encoding="utf-8", errors="ignore").strip()
-                if text.startswith("OPENAI_API_KEY="):
-                    text = text[len("OPENAI_API_KEY="):].strip().strip('"').strip("'")
-                if len(text) >= 20:
-                    os.environ["OPENAI_API_KEY"] = text
-                    print("[api key] Bundled key loaded (value not shown).")
-                    return
+                key = self._parse_key_text(
+                    path.read_text(encoding="utf-8", errors="ignore"))
+                if key:
+                    os.environ["OPENAI_API_KEY"] = key
+                    self._key_source = f"key file ({path.parent.name})"
+                    print("[api key] Key loaded from a key file (value not shown).")
+                    return True
             except Exception:
                 continue
+        return False
 
     def _load_key_from_keychain(self):
-        """Load the key from macOS Keychain into this process only.
-        The key value is never printed or logged."""
-        self._load_bundled_key()
+        """Load the key into this process only.
+
+        v1.0.10 load order (v1.0.9 bug: Keychain was read AFTER the
+        bundled key and overwrote it unconditionally, so any stale
+        Keychain entry clobbered a good bundled key): bundled / local
+        key file first, Keychain only if no key is set yet. A key
+        once loaded is never overwritten. The value is never printed
+        or logged.
+        """
+        if self._load_bundled_key():
+            return
         try:
             import subprocess
             out = subprocess.run(
@@ -892,7 +997,10 @@ class OracleGUI:
                  "-s", "Oracle-OpenAI-API-Key", "-w"],
                 capture_output=True, text=True, timeout=10)
             if out.returncode == 0 and out.stdout.strip():
-                os.environ["OPENAI_API_KEY"] = out.stdout.strip()
+                key = self._parse_key_text(out.stdout)
+                if key:
+                    os.environ["OPENAI_API_KEY"] = key
+                    self._key_source = "macOS Keychain"
         except Exception:
             pass
 
@@ -911,10 +1019,12 @@ class OracleGUI:
         dlg.geometry("460x240")
         dlg.transient(self.root)
         dlg.grab_set()
-        tk.Label(dlg, text="Paste your new OpenAI API key below.",
+        tk.Label(dlg, text="Paste your new OpenAI API key below, or import a key file.",
                  font=("Helvetica Neue", 11, "bold")).pack(anchor="w", padx=16, pady=(14, 4))
         tk.Label(dlg, text="It is checked with a quick test call, then saved in your\n"
-                 "macOS Keychain only — never in source code, logs, email,\nor GitHub. The running agent uses it at once.",
+                 "macOS Keychain (with a local fallback file if Keychain\n"
+                 "refuses) — never in source code, logs, email, or GitHub.\n"
+                 "The running agent uses it at once.",
                  font=("Helvetica Neue", 9), justify="left").pack(anchor="w", padx=16, pady=(0, 8))
         entry = tk.Entry(dlg, font=("Helvetica Neue", 11), show="*", width=42)
         entry.pack(padx=16, fill="x")
@@ -929,41 +1039,88 @@ class OracleGUI:
         tk.Button(btns, text="Cancel", font=("Helvetica Neue", 10),
                   command=dlg.destroy).pack(side="left")
 
+        def _persist_key(key):
+            """Save a validated key. Keychain first; if it fails (a
+            macOS prompt denied, v1.0.9 lost the key entirely here),
+            fall back to the local 0600 key file. Returns a note."""
+            try:
+                self._save_key_to_keychain(key)
+                self._key_source = "macOS Keychain"
+                return "saved in Keychain"
+            except Exception:
+                try:
+                    self._save_key_locally(key)
+                    self._key_source = "local key file"
+                    return "saved in a local key file (Keychain refused)"
+                except Exception as e2:
+                    return f"could not be saved ({e2})"
+
+        def _save_validated(key, note_holder):
+            note = _persist_key(key)
+            note_holder.append(note)
+            os.environ["OPENAI_API_KEY"] = key
+
         def _do_save():
-            new_key = entry.get().strip()
+            # v1.0.10: strip a pasted "OPENAI_API_KEY=..." line, quotes
+            # and whitespace — v1.0.9 validated the raw paste, so
+            # pasting the whole line from oracle-key.env failed.
+            new_key = self._parse_key_text(entry.get())
             if not new_key:
-                status.config(text="Paste a key first.", fg="red")
+                status.config(text="Paste a key first (a bare key, or an OPENAI_API_KEY= line).", fg="red")
                 return
             save_btn.config(state="disabled")
             status.config(text="Validating the key with OpenAI…", fg="black")
             def _run():
                 ok, msg = self._validate_api_key(new_key)
                 if ok:
-                    try:
-                        self._save_key_to_keychain(new_key)
-                    except Exception as e:
-                        self.root.after(0, lambda: status.config(
-                            text=f"Key is valid but Keychain save failed: {e}", fg="red"))
-                        self.root.after(0, lambda: save_btn.config(state="normal"))
-                        return
-                    os.environ["OPENAI_API_KEY"] = new_key
-                    self.root.after(0, lambda: self._api_key_saved(dlg))
+                    notes = []
+                    _save_validated(new_key, notes)
+                    self.root.after(0, lambda: self._api_key_saved(dlg, notes[0] if notes else ""))
                 else:
                     self.root.after(0, lambda: (status.config(text=f"Key invalid — {msg}", fg="red"),
                                                 save_btn.config(state="normal")))
             threading.Thread(target=_run, daemon=True).start()
         save_btn.config(command=_do_save)
+
+        def _import_file():
+            """Pick an oracle-key.env file — no copy/paste, no digging
+            inside the .app bundle (v1.0.9's drop-in step)."""
+            import tkinter.filedialog as fd
+            path = fd.askopenfilename(
+                title="Import API key file — pick oracle-key.env",
+                filetypes=[("Key files", "*.env *.txt"),
+                           ("All files", "*.*")])
+            if not path:
+                return
+            try:
+                key = self._parse_key_text(Path(path).read_text(encoding="utf-8", errors="ignore"))
+            except Exception as e:
+                status.config(text=f"Could not read that file: {e}", fg="red")
+                return
+            if not key:
+                status.config(text="No key found in that file — it should contain OPENAI_API_KEY=sk-…", fg="red")
+                return
+            entry.delete(0, tk.END)
+            entry.insert(0, key)
+            _do_save()
+        tk.Button(btns, text="Import key file…", font=("Helvetica Neue", 10),
+                  command=_import_file).pack(side="left", padx=(0, 8))
         dlg.bind("<Return>", lambda _e: _do_save())
 
-    def _api_key_saved(self, dlg):
+    def _api_key_saved(self, dlg, note=""):
         self._refresh_api_key_label()
-        self.append("system", "API key updated — the new key is active now. (The key itself is never shown here.)")
+        extra = f" ({note})" if note else ""
+        self.append("system", f"API key updated — the new key is active now{extra}. (The key itself is never shown here.)")
         dlg.after(1200, dlg.destroy)
 
     @staticmethod
     def _validate_api_key(key):
         import json as _json
         import urllib.request as _url
+        # Defence in depth: strip a pasted OPENAI_API_KEY= prefix here too.
+        key = OracleGUI._parse_key_text(key) if key else ""
+        if not key:
+            return False, "no key found — paste the key, or an OPENAI_API_KEY= line."
         try:
             req = _url.Request(
                 "https://api.openai.com/v1/chat/completions",
@@ -1137,38 +1294,180 @@ class OracleGUI:
                 self.root.after(0, lambda: self.append("system", f"Improvement check failed: {e}"))
         threading.Thread(target=_run, daemon=True).start()
 
+    # ------------------------------------------------ camera watch: ALWAYS ON
+    # Camera watch is ALWAYS ON from startup (2026-11-24, Lorenza,
+    # parity with Windows). Before this, watch was manual-only:
+    # watcher started as None, "Camera: OFF", until the user clicked
+    # "Start camera watch". Now the GUI starts watch itself at
+    # launch, in a worker thread, and retries every 30 s if the
+    # camera is busy / fails to open — never silently off. The user
+    # can still stop it (button / Privacy mode); that sets
+    # _camera_watch_user_stopped, which stops the retry loop too.
+    def _start_watch(self):
+        """Create the controller + Watcher and start it. Returns the
+        start message. Raises on failure, leaving watcher None.
+        Callable from any thread; UI updates are separate."""
+        if camera_mod is None:
+            raise RuntimeError("camera.py not found, or OpenCV is not installed. Run: pip3 install opencv-python")
+        controller = camera_mod.CameraController()
+        watcher = camera_mod.Watcher(
+            controller=controller,
+            on_alert=lambda txt: self.root.after(0, lambda: self.append("system", txt)),
+            on_track=lambda info: self.root.after(0, lambda: self._on_track_update(info)),
+        )
+        try:
+            msg = watcher.start()
+        except Exception:
+            try:
+                controller.close()
+            except Exception:
+                pass
+            raise
+        self.camera_controller = controller
+        self.watcher = watcher
+        return msg
+
+    def _apply_watch_on(self, msg):
+        """Main-thread UI for watch running."""
+        if self.watcher is None:
+            return  # user stopped it between start and this UI update
+        # Auto-track defaults ON when the camera is on (item 7).
+        try:
+            self.watcher.set_auto_track(self.auto_track_enabled)
+            self._refresh_track_button()
+            self._on_track_update({})
+        except Exception:
+            pass
+        self.watch_btn.config(text="Stop camera watch", bg=self.t["danger"])
+        self.cam_label.config(text="Camera: WATCHING", fg=self.t["danger"])
+        self.cam_pill.config(text="CAM: ON", fg=self.t["danger"])
+        self.append("system", msg + " Motion alerts will be emailed if SMTP is set, otherwise they appear here and in alerts/.")
+
+    def _apply_watch_off(self, msg="Watcher stopped."):
+        """Main-thread UI for watch stopped by the user."""
+        try:
+            self.track_label.config(text="Tracking: —", fg=self.t["muted"])
+        except Exception:
+            pass
+        self.watch_btn.config(text="Start camera watch", bg=self.t["panel2"])
+        self.cam_label.config(text="Camera: OFF", fg=self.t["muted"])
+        self.cam_pill.config(text="CAM: OFF", fg=self.t["muted"])
+        self.append("system", msg)
+
+    def _apply_watch_failed(self, short, attempt):
+        """Main-thread UI for a failed auto-start attempt. Shows the
+        failure plainly (never silently off) and that it retries."""
+        self.watch_btn.config(text="Start camera watch", bg=self.t["panel2"])
+        self.cam_label.config(text=f"Camera: OFF — retrying ({attempt})", fg=self.t["danger"])
+        self.cam_pill.config(text="CAM: OFF", fg=self.t["muted"])
+        if attempt == 1:
+            self.append("system", f"Camera watch could not start: {short}. Retrying every 30 seconds — if it stays off, close other camera apps, or unplug and replug the camera.")
+
+    def _start_camera_watch_auto(self):
+        """Start camera watch at launch, in a worker thread, so a
+        slow camera probe never blocks the GUI from opening."""
+        if camera_mod is None:
+            self.cam_label.config(text="Camera: OFF — camera.py missing", fg=self.t["danger"])
+            self.cam_pill.config(text="CAM: OFF", fg=self.t["muted"])
+            self.append("system", "Camera watch is off: camera.py not found, or OpenCV is not installed. Run: pip3 install opencv-python")
+            self._log_gui("CAMERA WATCH AUTO-START FAILED: camera module not available")
+            return
+        self._camera_watch_user_stopped = False
+        self.cam_label.config(text="Camera: STARTING…", fg=self.t["accent"])
+        self.cam_pill.config(text="CAM: …", fg=self.t["muted"])
+        threading.Thread(target=self._camera_watch_auto_loop, daemon=True).start()
+
+    def _camera_watch_auto_loop(self):
+        """Retry loop: start watch, retry every 30 s on failure until
+        it opens, the user stops it, or Privacy mode is used."""
+        attempt = 0
+        while not self._camera_watch_user_stopped:
+            if self.watcher is not None:
+                return
+            attempt += 1
+            try:
+                msg = self._start_watch()
+                self._log_gui(f"CAMERA WATCH AUTO-STARTED: {msg}")
+                self._post_ui(lambda m=msg: self._apply_watch_on(m))
+                return
+            except Exception as e:
+                err = " ".join(str(e).split())
+                self._log_gui(f"CAMERA WATCH AUTO-START FAILED (attempt {attempt}): {err}")
+                short = err if len(err) <= 120 else err[:117] + "…"
+                self._post_ui(lambda s=short, a=attempt: self._apply_watch_failed(s, a))
+                for _ in range(60):  # 30 s, checked every 0.5 s so Stop/Privacy stops it promptly
+                    if self._camera_watch_user_stopped or self.watcher is not None:
+                        return
+                    time.sleep(0.5)
+
     def toggle_watch(self):
         if camera_mod is None:
             self.append("system", "camera.py not found, or OpenCV is not installed. Run: pip3 install opencv-python")
             return
         if self.watcher is None:
+            self._camera_watch_user_stopped = False
             try:
-                self.camera_controller = camera_mod.CameraController()
-                self.watcher = camera_mod.Watcher(
-                    controller=self.camera_controller,
-                    on_alert=lambda txt: self.root.after(0, lambda: self.append("system", txt)),
-                    on_track=lambda info: self.root.after(0, lambda: self._on_track_update(info)),
-                )
-                msg = self.watcher.start()
-                # Auto-track defaults ON when the camera is on (item 7).
-                self.watcher.set_auto_track(self.auto_track_enabled)
-                self._refresh_track_button()
-                self._on_track_update({})
-                self.watch_btn.config(text="Stop camera watch", bg=self.t["danger"])
-                self.cam_label.config(text="Camera: WATCHING", fg=self.t["danger"])
-                self.cam_pill.config(text="CAM: ON", fg=self.t["danger"])
-                self.append("system", msg + " Motion alerts will be emailed if SMTP is set, otherwise they appear here and in alerts/.")
+                msg = self._start_watch()
+                self._apply_watch_on(msg)
+                self._log_gui(f"CAMERA WATCH STARTED (button): {msg}")
             except Exception as e:
+                self._log_gui(f"CAMERA WATCH START FAILED (button): {e}")
                 self.append("system", f"Could not start camera: {e}")
                 self.watcher = None
+                self.camera_controller = None
         else:
+            self._camera_watch_user_stopped = True
             msg = self.watcher.stop()
             self.watcher = None
-            self.track_label.config(text="Tracking: —", fg=self.t["muted"])
-            self.watch_btn.config(text="Start camera watch", bg=self.t["panel2"])
-            self.cam_label.config(text="Camera: OFF", fg=self.t["muted"])
-            self.cam_pill.config(text="CAM: OFF", fg=self.t["muted"])
-            self.append("system", msg)
+            self._apply_watch_off(msg)
+            self._log_gui("CAMERA WATCH STOPPED by user")
+
+    # ------------------------------------------------ camera preview box
+    # Small live preview in the lower right corner (2026-11-24,
+    # Lorenza, parity with Windows). Same feed watch is using
+    # (camera.latest_frame) — no second camera open. place()
+    # overlay, anchored to the window's lower right, just above the
+    # input bar so it never covers SEND. Shows a plain message in
+    # the box when there is no frame yet / the camera is off.
+    def _build_cam_preview(self):
+        frame = tk.Frame(self.root, bg=self.t["panel"], padx=1, pady=1)
+        frame.place(relx=1.0, rely=1.0, x=-12, y=-62, anchor="se", width=232, height=152)
+        tk.Label(frame, text="CAMERA", font=("Helvetica Neue", 8, "bold"),
+                 fg=self.t["accent"], bg=self.t["panel"]).pack(anchor="w", padx=4)
+        self._cam_preview_label = tk.Label(
+            frame, text="Camera starting…", font=("Helvetica Neue", 9),
+            fg=self.t["muted"], bg="#000000", width=28, height=7)
+        self._cam_preview_label.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        self._update_cam_preview()
+
+    def _update_cam_preview(self):
+        try:
+            frame = None
+            if camera_mod is not None:
+                frame = getattr(camera_mod, "latest_frame", None)
+            if frame is not None and Image is not None and self._cam_preview_label is not None:
+                rgb = frame[:, :, ::-1].copy()
+                img = Image.fromarray(rgb)
+                img = img.resize((224, 126), Image.LANCZOS)
+                photo = ImageTk.PhotoImage(img)
+                self._cam_preview_photo = photo
+                self._cam_preview_label.config(image=photo, text="")
+            elif self._cam_preview_label is not None:
+                if self.watcher is None:
+                    msg = "Camera off" if self._camera_watch_user_stopped else "Camera starting…"
+                else:
+                    msg = "Camera on — waiting for frames…"
+                self._cam_preview_label.config(image="", text=msg)
+        except Exception as e:
+            try:
+                if self._cam_preview_label is not None:
+                    self._cam_preview_label.config(image="", text=f"Camera preview error: {e}")
+            except Exception:
+                pass
+        try:
+            self.root.after(200, self._update_cam_preview)
+        except Exception:
+            pass
 
     def camera_ptz(self, pan, tilt, zoom):
         if self.camera_controller is None:
@@ -1178,6 +1477,9 @@ class OracleGUI:
         self.append("system", f"PTZ: pan {result['pan']}°, tilt {result['tilt']}°, zoom {result['zoom']}x. UVC pan/tilt/zoom worked: {result['uvc_pan_ok']}/{result['uvc_tilt_ok']}/{result['uvc_zoom_ok']}. {result['note']}")
 
     def camera_privacy(self):
+        # Privacy also stops the auto-start retry loop, so watch does
+        # not come back on by itself after the user chose privacy.
+        self._camera_watch_user_stopped = True
         if self.watcher is not None:
             self.toggle_watch()
         if self.camera_controller is not None:
@@ -1267,6 +1569,67 @@ class OracleGUI:
                 self.root.after(0, lambda: self.append("system", f"Board look failed: {e}"))
         threading.Thread(target=_run, daemon=True).start()
 
+    def _run_pan_describe(self):
+        """Run the pan-and-describe sweep synchronously; call from a
+        worker thread. Returns the spoken description (or a plain
+        explanation when it could not be done). Progress lines are
+        posted to the chat as the sweep runs."""
+        if camera_mod is None:
+            return "I can't use the camera — camera.py is not available, or OpenCV is not installed."
+        # Reuse the watcher's controller when camera watch is on, so we
+        # do not fight a second open of the same camera.
+        controller = self.camera_controller
+        own = False
+        if controller is None:
+            controller = camera_mod.CameraController()
+            own = True
+
+        def _pause_tracking():
+            # Pause auto-tracking during the sweep so it does not fight
+            # the commanded pan; resume afterwards. The Mac Watcher has
+            # set_auto_track (auto-track defaults ON when watching).
+            watcher = self.watcher
+            if watcher is not None and hasattr(watcher, "set_auto_track"):
+                try:
+                    was_on = bool(getattr(watcher, "auto_track", False))
+                    watcher.set_auto_track(False)
+
+                    def _resume():
+                        if was_on:
+                            watcher.set_auto_track(True)
+                    return _resume
+                except Exception:
+                    return None
+            return None
+
+        try:
+            result = camera_mod.pan_and_describe(
+                controller=controller,
+                progress=lambda m: self._post_ui(
+                    lambda msg=m: self.append("system", msg)),
+                pause_tracking=_pause_tracking)
+            return result["description"]
+        except Exception as e:
+            return f"The pan-and-describe sweep failed: {e}."
+        finally:
+            if own:
+                try:
+                    controller.close()
+                except Exception:
+                    pass
+
+    def pan_describe_gui(self):
+        """'Pan & describe what you see' button: sweep in a thread,
+        then speak/show the full description."""
+        if self.busy:
+            self.append("system", "Hold on — I am still answering. Ask me to look around again in a moment.")
+            return
+        self.append("system", "Panning the camera left to right, then right to left, and describing everything I see...")
+        def _run():
+            desc = self._run_pan_describe()
+            self._post_ui(lambda: self._typewriter(desc))
+        threading.Thread(target=_run, daemon=True).start()
+
     def _handle_camera_command(self, user_text, spoken=False):
         """Local camera commands: 'track me', 'stop tracking', 'who is
         that', 'enrol this person as <name>'. Returns True if handled
@@ -1276,6 +1639,25 @@ class OracleGUI:
         if not low:
             return False
         watcher = self.watcher
+
+        # "What do you see?" — pan-and-describe (2026-11-24): a camera
+        # command, not a chat question. Pan left->right then right->left
+        # and describe everything seen. Runs in a thread (the sweep
+        # takes ~a minute with vision); auto-track pauses during the
+        # sweep and resumes after, camera watch stays on throughout.
+        if (camera_mod is not None
+                and hasattr(camera_mod, "is_pan_describe_request")
+                and camera_mod.is_pan_describe_request(user_text)):
+            self.append("user", user_text + ("  [spoken]" if spoken else ""))
+            if self.busy:
+                self.append("system", "Hold on — I am still answering. Ask me to look around again in a moment.")
+                return True
+            self.append("system", "Panning the camera left to right, then right to left, and describing everything I see...")
+            def _run_pan():
+                desc = self._run_pan_describe()
+                self._post_ui(lambda: self._typewriter(desc))
+            threading.Thread(target=_run_pan, daemon=True).start()
+            return True
 
         def _need_watcher():
             if watcher is None:

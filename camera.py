@@ -84,6 +84,10 @@ except Exception:
 BASE_DIR = Path(__file__).resolve().parent
 ALERTS_DIR = BASE_DIR / "alerts"
 
+# Same no-frame failure seen on Windows (-2147483638 / 0x8000000A):
+# the camera "opens" but yields no frames.
+NO_FRAME_ERROR = "-2147483638 / 0x8000000A"
+
 CAMERA_INDEX = int(os.environ.get("CAMERA_INDEX", "0"))
 ARMED = os.environ.get("CAMERA_ARMED", "1") == "1"
 VISION_ENABLED = os.environ.get("CAMERA_VISION", "1") == "1"
@@ -273,6 +277,353 @@ def describe_snapshot(image_path):
     with urllib.request.urlopen(req, timeout=60) as resp:
         data = json.loads(resp.read())
     return data["choices"][0]["message"]["content"].strip()
+
+
+# ----------------------------------------------------------------------
+# Pan-and-describe (2026-11-24, Lorenza's request)
+#   "When I ask what it sees I need it to describe everything it sees
+#    as the camera pans from left to right and right to left."
+#
+# Before this, "what do you see" had no camera path at all in the GUI:
+# the only vision use was a SINGLE still snapshot — describe_snapshot()
+# for a motion alert, and RepairSession.look_at_board() for one board
+# photo. Nothing panned, nothing combined several views.
+#
+# pan_and_describe() is a COMMANDED sweep, not auto-tracking:
+#   1. Pause auto-tracking (if any is running — the caller passes a
+#      pause_tracking callable; on Windows there is no tracker yet,
+#      on Mac the Watcher has set_auto_track()). Resume it afterwards.
+#   2. Pan left -> right in stops, capturing a frame at each stop.
+#   3. Pan right -> left, capturing again at each stop (things move).
+#   4. Describe each leg with OpenAI Vision, then merge the two legs
+#      into ONE coherent spoken description, in left-to-right order.
+#   5. Return the camera to exactly where it started (pan, zoom, crop).
+#
+# Physical pan: UVC CAP_PROP_PAN via controller.ptz(). The PIXY often
+# ignores UVC PTZ (EMEET routes the motor through EMEET Studio),
+# so if UVC pan reports False on the first move, the sweep falls back
+# to DIGITAL pan: zoom 1.5x and slide the crop window left -> right
+# across the wide frame. The result always says honestly which mode
+# was used ("physical pan" vs "digital pan"), and if no frames can be
+# read at all it says so plainly instead of inventing a description.
+# Frames + description are saved under alerts/pan-YYYYMMDD-HHMMSS/.
+# ----------------------------------------------------------------------
+
+PAN_SWEEP_DEG = 60          # sweep +/- this many degrees from the start pan
+PAN_SWEEP_STOPS = 5         # capture positions per leg (far left..far right)
+PAN_SETTLE_SEC = 0.9        # wait after each move for the motor / frame to settle
+PAN_VISION_MAX_WIDTH = 960  # frames are downscaled to this width for vision
+PAN_POSITION_LABELS = ("far left", "left", "centre", "right", "far right")
+
+# Phrases that mean "pan the camera and describe everything you see".
+# Matched by gui.py _ask() (and the CLI) before the LLM is called.
+# "Look at board" is NOT in here - that stays on the repair path.
+PAN_DESCRIBE_PHRASES = (
+    "what do you see", "describe what you see", "what can you see",
+    "what do you see in the room", "describe the room",
+    "look around", "look around the room", "scan the room",
+    "pan and describe", "pan around", "pan the camera",
+    "what's around", "what is around", "describe everything you see",
+    "tell me what you see",
+)
+
+
+def is_pan_describe_request(text):
+    """True if the user is asking Oracle to pan and describe the room."""
+    if not text:
+        return False
+    low = " ".join(str(text).lower().split())
+    return any(p in low for p in PAN_DESCRIBE_PHRASES)
+
+
+def _encode_frame_b64(frame, max_width=PAN_VISION_MAX_WIDTH):
+    """Downscale a frame and return it as a base64 JPEG string."""
+    cv2 = _cv2()
+    h, w = frame.shape[:2]
+    if w > max_width:
+        frame = cv2.resize(frame, (max_width, int(h * max_width / w)))
+    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 82])
+    if not ok:
+        raise RuntimeError("could not JPEG-encode a camera frame")
+    return base64.b64encode(buf.tobytes()).decode()
+
+
+def _openai_chat(payload, timeout=90):
+    """One OpenAI chat-completions call. Key comes from the env var only."""
+    import json
+    import urllib.request
+    key = os.environ.get("OPENAI_API_KEY", "")
+    if not key:
+        raise RuntimeError("OPENAI_API_KEY is not set on this PC.")
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=json.dumps(payload).encode(),
+        headers={"Authorization": f"Bearer {key}",
+                 "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read())
+    return data["choices"][0]["message"]["content"].strip()
+
+
+def _vision_describe_leg(frames, leg_label):
+    """Describe one sweep leg (list of (label, b64) frames) with Vision.
+
+    One call, all frames of the leg at once, so the model sees the
+    whole leg in order and can say what is where, left to right.
+    """
+    if not VISION_ENABLED:
+        raise RuntimeError("Vision is off (CAMERA_VISION=0).")
+    model = os.environ.get("OPENAI_VISION_MODEL",
+                           os.environ.get("OPENAI_MODEL", "gpt-4o-mini"))
+    content = [{
+        "type": "text",
+        "text": (
+            f"This is a camera sweep, {leg_label}, of one room. The frames "
+            "are in sweep order. Describe EVERYTHING you can see across "
+            "all of these frames, in detail and in left-to-right order: "
+            "every person (what they are doing, what they are wearing), "
+            "every animal, every piece of furniture, objects on tables "
+            "and shelves, doors, windows, screens, and anything unusual, "
+            "broken, fallen, or out of place. Say which part of the room "
+            "(far left / left / centre / right / far right) each thing is "
+            "in. Do not guess at identities of people. If a frame is dark "
+            "or blurry, say so instead of inventing what is in it."),
+    }]
+    for label, b64 in frames:
+        content.append({"type": "text", "text": f"Frame: {label}."})
+        content.append({"type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+    return _openai_chat({
+        "model": model,
+        "messages": [{"role": "user", "content": content}],
+        "max_tokens": 700,
+    })
+
+
+def _vision_merge(leg_ltr, leg_rtl):
+    """Merge the two legs' descriptions into one spoken description."""
+    model = os.environ.get("OPENAI_VISION_MODEL",
+                           os.environ.get("OPENAI_MODEL", "gpt-4o-mini"))
+    return _openai_chat({
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": (
+                "Merge these two descriptions of the same room into ONE "
+                "clear spoken description, in left-to-right order, as if "
+                "you are telling the homeowner what the camera saw while "
+                "it panned left to right and then right to left. Keep "
+                "every distinct object, person, and detail from both "
+                "passes; drop exact duplicates. Mention anything that "
+                "appeared in only one pass. Write it to be spoken aloud: "
+                "natural sentences, contractions, no bullet lists, no "
+                "headings. Start with a plain sentence like 'Panning "
+                "across the room, from left to right, I can see...'.\n\n"
+                f"LEFT-TO-RIGHT PASS:\n{leg_ltr}\n\n"
+                f"RIGHT-TO-LEFT PASS:\n{leg_rtl}"),
+        }],
+        "max_tokens": 800,
+    })
+
+
+def pan_and_describe(controller=None, steps=PAN_SWEEP_STOPS,
+                     sweep_deg=PAN_SWEEP_DEG, settle_sec=PAN_SETTLE_SEC,
+                     progress=None, pause_tracking=None):
+    """Pan left->right then right->left, describe everything seen.
+
+    controller: a CameraController (opened by us if not given, or if
+        not already open). If None, one is created and closed at the end.
+    progress: optional fn(str) called with plain-English progress lines
+        ("Panning left to right...", "Describing what I saw...").
+    pause_tracking: optional fn() -> resume fn (or None). Called before
+        the sweep and its result called afterwards, so auto-tracking
+        does not fight the sweep. On Windows there is no tracker yet,
+        so callers may pass None; on Mac pass watcher.set_auto_track.
+
+    Returns a dict: {"ok": bool, "description": str, "pan_mode":
+    "uvc"|"digital"|"none", "frames": [paths], "run_dir": str,
+    "start_pan": float, "error": str|None}. On failure ok is False and
+    "description" is a plain-English explanation, never invented.
+    """
+    def _say(msg):
+        if progress is not None:
+            try:
+                progress(msg)
+            except Exception:
+                pass
+
+    own_controller = controller is None
+    if controller is None:
+        controller = CameraController()
+    resume_tracking = None
+    if pause_tracking is not None:
+        try:
+            resume_tracking = pause_tracking()
+        except Exception:
+            resume_tracking = None
+    run_dir = None
+    try:
+        try:
+            if controller.cap is None:
+                controller.open()
+        except Exception as e:
+            return {"ok": False,
+                    "description": ("I could not open the camera to look "
+                                    f"around: {e}"),
+                    "pan_mode": "none", "frames": [], "run_dir": None,
+                    "start_pan": getattr(controller, "pan", 0),
+                    "error": str(e)}
+        start_pan = getattr(controller, "pan", 0)
+        start_zoom = getattr(controller, "zoom", 1.0)
+        start_crop_x = getattr(controller, "crop_x", 0.5)
+
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        run_dir = ALERTS_DIR / f"pan-{stamp}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        # --- Decide physical vs digital pan with one probe move. ---
+        _say("Panning the camera to the far left to start the sweep...")
+        probe = controller.ptz(pan_delta=-sweep_deg)
+        time.sleep(settle_sec)
+        physical = bool(probe.get("uvc_pan_ok"))
+        pan_mode = "uvc" if physical else "digital"
+        if not physical:
+            _say("The PIXY ignored the motor pan command, so I am sweeping "
+                 "digitally across the wide frame instead.")
+            # The probe move above already changed the controller's
+            # *logical* pan even though the motor ignored it — reset it,
+            # or every later PTZ move would start from a wrong position.
+            controller.pan = start_pan
+            try:
+                controller.ptz(zoom_delta=0.5)  # zoom 1.0 -> 1.5x for cropping
+            except Exception:
+                pass
+
+        positions = []
+        for i in range(steps):
+            frac = (i / (steps - 1)) if steps > 1 else 0.5
+            positions.append(-sweep_deg + 2 * sweep_deg * frac)
+        labels = PAN_POSITION_LABELS if steps == 5 else [
+            f"position {i + 1} of {steps}" for i in range(steps)]
+
+        def _capture_at(rel_pan, label, leg, idx):
+            """Move to rel_pan (deg from start) and capture one frame."""
+            if physical:
+                # controller.pan is absolute; move to start_pan + rel_pan.
+                target = start_pan + rel_pan
+                controller.ptz(pan_delta=target - getattr(controller, "pan", 0))
+            else:
+                # Digital pan: slide the crop window across the frame.
+                controller.crop_x = 0.5 + (rel_pan / sweep_deg) * 0.3 \
+                    if sweep_deg else 0.5
+            time.sleep(settle_sec)
+            frame = controller.read()
+            if frame is None:
+                return None
+            name = f"{leg}-{idx:02d}-{label.replace(' ', '-')}.jpg"
+            path = run_dir / name
+            cv2 = _cv2()
+            if not cv2.imwrite(str(path), frame):
+                return None
+            return (label, path, frame)
+
+        legs = {}
+        for leg, leg_label, order in (
+                ("ltr", "left to right", positions),
+                ("rtl", "right to left", list(reversed(positions)))):
+            _say(f"Panning {leg_label}...")
+            shots = []
+            # order is positions (ltr) or reversed(positions) (rtl); the
+            # label comes from the position's index in `positions`.
+            for idx, rel_pan in enumerate(order):
+                label = labels[positions.index(rel_pan)]
+                shot = _capture_at(rel_pan, label, leg, idx)
+                if shot is not None:
+                    shots.append(shot)
+            legs[leg] = shots
+
+        # --- Return the camera exactly where it started. ---
+        try:
+            if physical:
+                controller.ptz(pan_delta=start_pan - getattr(controller, "pan", 0))
+            else:
+                # Digital mode never moved the motor; just fix the
+                # logical pan the probe move polluted.
+                controller.pan = start_pan
+            controller.zoom = start_zoom
+            controller.crop_x = start_crop_x
+        except Exception:
+            pass
+
+        frames = [str(p) for leg in ("ltr", "rtl")
+                  for (_l, p, _f) in legs[leg]]
+        if not frames:
+            return {"ok": False,
+                    "description": ("The camera panned, but I could not "
+                                    "grab any frames during the sweep — the "
+                                    "camera may be in use by another app, or "
+                                    f"it hit the no-frame error "
+                                    f"({NO_FRAME_ERROR}). Try closing EMEET "
+                                    "Studio, unplugging and replugging the "
+                                    "PIXY, and asking again."),
+                    "pan_mode": pan_mode, "frames": [], "run_dir": str(run_dir),
+                    "start_pan": start_pan,
+                    "error": "no frames captured during sweep"}
+
+        _say("Describing everything I saw across the whole sweep...")
+        try:
+            leg_texts = {}
+            for leg, leg_label in (("ltr", "left to right"),
+                                   ("rtl", "right to left")):
+                shots = legs[leg]
+                if not shots:
+                    leg_texts[leg] = "(no frames captured on this pass)"
+                    continue
+                encoded = [(label, _encode_frame_b64(frame))
+                           for (label, _p, frame) in shots]
+                leg_texts[leg] = _vision_describe_leg(encoded, leg_label)
+            description = _vision_merge(leg_texts["ltr"], leg_texts["rtl"])
+        except Exception as e:
+            description = (
+                "I panned across the room left to right and back, and saved "
+                f"{len(frames)} frames under {run_dir}, but the vision "
+                f"description failed: {e}. The frames are saved — I can "
+                "try describing them again, or you can look at them.")
+            (run_dir / "description.txt").write_text(description,
+                                                     encoding="utf-8")
+            return {"ok": False, "description": description,
+                    "pan_mode": pan_mode, "frames": frames,
+                    "run_dir": str(run_dir), "start_pan": start_pan,
+                    "error": str(e)}
+
+        if pan_mode == "digital":
+            description = ("(The camera motor did not respond to the pan "
+                           "command, so I swept the view digitally across "
+                           "the wide frame instead — same room, same "
+                           "left-to-right description.)\n\n" + description)
+        (run_dir / "description.txt").write_text(description, encoding="utf-8")
+        return {"ok": True, "description": description,
+                "pan_mode": pan_mode, "frames": frames,
+                "run_dir": str(run_dir), "start_pan": start_pan,
+                "error": None}
+    finally:
+        if resume_tracking is not None:
+            try:
+                resume_tracking()
+            except Exception:
+                pass
+        if own_controller:
+            try:
+                controller.close()
+            except Exception:
+                pass
+
+
+def describe_what_you_see(controller=None, **kwargs):
+    """Convenience alias: pan the camera and describe everything seen."""
+    return pan_and_describe(controller=controller, **kwargs)
+
 
 
 class Watcher:
@@ -541,6 +892,16 @@ class Watcher:
 
 
 if __name__ == "__main__":
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "pan":
+        # python3 camera.py pan — full sweep test: pan left->right then
+        # right->left, describe everything seen, return to start.
+        result = pan_and_describe(progress=lambda m: print(f"[pan] {m}"))
+        print(f"ok={result['ok']} pan_mode={result['pan_mode']} "
+              f"frames={len(result['frames'])} run_dir={result['run_dir']}")
+        print()
+        print(result["description"])
+        raise SystemExit(0 if result["ok"] else 1)
     print("Testing camera - press Ctrl+C to stop. Motion alerts will print here.")
     w = Watcher()
     print(w.start())
